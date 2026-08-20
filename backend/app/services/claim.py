@@ -33,11 +33,40 @@ async def claim_jobs(
     session: AsyncSession, queue_id: UUID, worker_id: UUID, batch_size: int
 ) -> list[ClaimedJob]:
     """Atomically claim up to batch_size jobs. Never exceeds the queue's
-    max_concurrency, and never returns a job another worker also holds."""
+    max_concurrency, and never returns a job another worker also holds.
+
+    Issued as TWO statements in one transaction, not one:
+
+    FOR NO KEY UPDATE only forces a fresh re-check of the LOCKED ROW ITSELF for a
+    transaction that blocked on it (Postgres's EvalPlanQual). It does not give the
+    rest of a single statement a fresh snapshot. If the queue lock and the
+    in-flight COUNT lived in the same statement, a claimer that waited behind
+    another transaction's commit would still see the in-flight count as it stood
+    when ITS statement started -- stale, understating in-flight jobs -- and
+    max_concurrency would overshoot under real concurrency. This was only caught
+    by a genuine concurrent stress test; nothing single-statement reveals it.
+
+    Splitting into two statements fixes it: step 2 is a NEW statement, and READ
+    COMMITTED gives every new statement a fresh snapshot -- taken only once the
+    lock already held in step 1 makes that snapshot safe to act on.
+    """
+    locked = (
+        await session.execute(text(load_sql("lock_queue")), {"queue_id": str(queue_id)})
+    ).first()
+    if locked is None:
+        # Queue is paused or does not exist. Do not issue the second statement at
+        # all -- there is nothing to compute headroom against.
+        return []
+
     rows = (
         await session.execute(
             text(load_sql("claim_jobs")),
-            {"queue_id": str(queue_id), "batch_size": batch_size, "worker_id": str(worker_id)},
+            {
+                "queue_id": str(queue_id),
+                "batch_size": batch_size,
+                "worker_id": str(worker_id),
+                "max_concurrency": locked.max_concurrency,
+            },
         )
     ).all()
     return [

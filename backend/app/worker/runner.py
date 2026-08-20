@@ -33,7 +33,8 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
-from sqlalchemy import select, text, update
+from sqlalchemy import Text, bindparam, select, text, update
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models.base import uuid7
@@ -112,6 +113,42 @@ _MARK_TIMED_OUT = text(
     " WHERE job_id = CAST(:jid AS uuid) AND lease_epoch = CAST(:ep AS bigint)"
     " AND status = 'failed'"
 )
+
+# SIGTERM: hand back claims that never reached the handler. Free, because attempt
+# increments at claimed -> running, so a released claim provably never executed and
+# nothing has to be decremented -- the monotonicity rule is never even approached.
+#
+# `status = 'claimed'` is the guard, not just a filter: a task that reached start_job
+# while shutdown was in flight owns a 'running' row and must NOT be yanked out from
+# under a live handler. The two writes race deliberately, and exactly one wins --
+# whichever loses sees zero rows and takes the other path.
+#
+# The ids bind is typed ARRAY(Text) and cast in SQL rather than passed as a '{a,b}'
+# array literal: asyncpg binds parameters by type, so a literal string arrives as a
+# str where a sequence is required and every release raises DataError -- silently
+# stranding every unstarted claim until its lease expires, which is the one outcome
+# graceful shutdown exists to avoid.
+_RELEASE_UNSTARTED = text(
+    "UPDATE jobs SET status='queued', worker_id=NULL, claimed_at=NULL,"
+    " lease_expires_at=NULL, lease_epoch=lease_epoch+1, updated_at=now()"
+    " WHERE id = ANY(CAST(:ids AS uuid[]))"
+    " AND worker_id = CAST(:wid AS uuid) AND status='claimed'"
+    " RETURNING id"
+).bindparams(bindparam("ids", type_=ARRAY(Text)))
+
+# Closes the job_executions row the claim opened, for exactly the jobs the release
+# above actually won (never the full offered set -- a job that raced its own
+# start_job to 'running' keeps its execution row open under the drain path below).
+# Without this the row stays open with finished_at IS NULL, and the NEXT claim's
+# execution INSERT hits ux_job_executions_open_one and raises 23505 forever: a
+# released-but-never-run job becomes permanently unclaimable. This is the same
+# class of bug the reaper's orphan-close CTE fixes for expired leases -- the
+# release path needs its own copy because it is a different SQL statement.
+_CLOSE_RELEASED_EXECUTIONS = text(
+    "UPDATE job_executions SET status='lost', finished_at=now(),"
+    " error_class='ReleasedBeforeStart'"
+    " WHERE job_id = ANY(CAST(:ids AS uuid[])) AND finished_at IS NULL"
+).bindparams(bindparam("ids", type_=ARRAY(Text)))
 
 
 class WorkerRunner:
@@ -548,21 +585,22 @@ class WorkerRunner:
         assert self.worker_id is not None
         # Unstarted claims cost nothing to release: attempt has not moved.
         if self._unstarted:
+            offered = [str(job_id) for job_id in self._unstarted]
             async with self.sessionmaker() as s:
-                await s.execute(
-                    text(
-                        "UPDATE jobs SET status='queued', worker_id=NULL, claimed_at=NULL,"
-                        " lease_expires_at=NULL, lease_epoch=lease_epoch+1, updated_at=now()"
-                        " WHERE id = ANY(CAST(:ids AS uuid[]))"
-                        " AND worker_id=CAST(:wid AS uuid) AND status='claimed'"
-                    ),
-                    {
-                        "ids": "{" + ",".join(str(i) for i in self._unstarted) + "}",
-                        "wid": str(self.worker_id),
-                    },
-                )
+                released = (
+                    await s.execute(
+                        _RELEASE_UNSTARTED, {"ids": offered, "wid": str(self.worker_id)}
+                    )
+                ).all()
+                if released:
+                    won_ids = [str(row.id) for row in released]
+                    await s.execute(_CLOSE_RELEASED_EXECUTIONS, {"ids": won_ids})
                 await s.commit()
-            log.info("worker.released_unstarted", count=len(self._unstarted))
+            # offered != released is normal and not an error: the difference is the
+            # claims that won the race to 'running' and are now being drained below.
+            log.info(
+                "worker.released_unstarted", released=len(released), offered=len(offered)
+            )
 
         if self._inflight:
             log.info("worker.draining", inflight=len(self._inflight))

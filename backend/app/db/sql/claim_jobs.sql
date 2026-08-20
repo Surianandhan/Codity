@@ -19,22 +19,18 @@
 -- it can never have. SKIP LOCKED steps over locked rows, so K workers partition the
 -- ready set with no coordination.
 --
--- Why COALESCE(max(n), 0): if the queue is paused or missing, `q` is empty, so
--- `headroom` is empty and a bare scalar subquery yields NULL. LIMIT NULL in
--- Postgres means NO LIMIT -- a paused queue would drain itself. max() over an
--- empty set is NULL, coalesced to 0, and LIMIT 0 claims nothing.
-WITH q AS (
-    SELECT id, max_concurrency
-      FROM queues
-     WHERE id = :queue_id
-       AND NOT is_paused
-     FOR NO KEY UPDATE
-),
-headroom AS (
+-- Pause and existence are checked by lock_queue.sql BEFORE this statement runs;
+-- app/services/claim.py returns [] without issuing this statement at all if that
+-- lock finds no row. headroom therefore always yields exactly one row here.
+-- The queue row's FOR NO KEY UPDATE lock is acquired by lock_queue.sql as a
+-- PRIOR statement in the same transaction. This statement must be issued only
+-- after that lock is held -- see app/services/claim.py::claim_jobs. Splitting it
+-- out is required for correctness, not style: see lock_queue.sql's header.
+WITH headroom AS (
     SELECT GREATEST(
                LEAST(
                    CAST(:batch_size AS int),
-                   q.max_concurrency
+                   CAST(:max_concurrency AS int)
                    - (SELECT count(*)::int
                         FROM jobs
                        WHERE queue_id = :queue_id
@@ -42,7 +38,6 @@ headroom AS (
                ),
                0
            )::int AS n
-      FROM q
 ),
 picked AS (
     SELECT j.id
@@ -53,6 +48,12 @@ picked AS (
      LIMIT (SELECT COALESCE(max(n), 0) FROM headroom)
      FOR UPDATE SKIP LOCKED
 ),
+-- Driving the UPDATE from `id = ANY(ARRAY(SELECT id FROM picked))` rather than a
+-- join to the `picked` CTE is what lets the planner use ix_jobs_claim's underlying
+-- primary key for the UPDATE's own row lookups. A `FROM picked p WHERE j.id = p.id`
+-- join instead makes jobs (not picked) the join's driving side for row
+-- identification, and Postgres has no cheaper way to drive that than a Hash Join
+-- built on a full scan of jobs -- exactly the Seq Scan this design exists to avoid.
 claimed AS (
     UPDATE jobs j
        SET status           = 'claimed',
@@ -61,8 +62,7 @@ claimed AS (
            claimed_at       = now(),
            lease_expires_at = now() + make_interval(secs => j.lease_seconds),
            updated_at       = now()
-      FROM picked p
-     WHERE j.id = p.id
+     WHERE j.id = ANY(ARRAY(SELECT id FROM picked))
  RETURNING j.id, j.organization_id, j.queue_id, j.handler, j.payload,
            j.attempt, j.max_attempts, j.timeout_ms, j.lease_epoch,
            j.claimed_at, j.run_at, j.correlation_id
