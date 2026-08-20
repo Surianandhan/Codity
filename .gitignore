@@ -25,3 +25,5 @@ dist/
 
 # Generated
 openapi.json
+submission/combined.md
+submission/combined.html
