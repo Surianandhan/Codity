@@ -6,7 +6,12 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 from app.config import get_settings
-from app.db.models import execution, scheduling, tenancy  # noqa: F401  (registers tables)
+from app.db.models import (  # noqa: F401  (registers tables)
+    execution,
+    observability,
+    scheduling,
+    tenancy,
+)
 from app.db.models.base import Base
 
 config = context.config

@@ -50,6 +50,7 @@ _KINDS = ", ".join(f"'{k.value}'" for k in JobKind)
 _TERMINAL = ", ".join(f"'{s.value}'" for s in sorted(TERMINAL_STATUSES))
 _INFLIGHT = ", ".join(f"'{s.value}'" for s in sorted(INFLIGHT_STATUSES))
 _LIVE = ", ".join(f"'{s.value}'" for s in sorted(LIVE_STATUSES))
+_CATCHUP_POLICIES = ", ".join(f"'{p}'" for p in ("skip", "catchup"))
 
 
 class RetryPolicy(Base, TimestampMixin):
@@ -218,8 +219,12 @@ class Job(Base, TimestampMixin):
     )
     project_id: Mapped[UUID] = mapped_column(nullable=False)
     queue_id: Mapped[UUID] = mapped_column(nullable=False)
-    batch_id: Mapped[UUID | None] = mapped_column()
-    schedule_id: Mapped[UUID | None] = mapped_column()
+    batch_id: Mapped[UUID | None] = mapped_column(ForeignKey("job_batches.id", ondelete="SET NULL"))
+    # RESTRICT, not CASCADE: deleting a schedule must not delete the history of
+    # what it already ran. Schedule deletion is soft (job_schedules.deleted_at).
+    schedule_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("job_schedules.id", ondelete="RESTRICT")
+    )
     replay_of_job_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("jobs.id", ondelete="SET NULL")
     )
@@ -266,3 +271,131 @@ class Job(Base, TimestampMixin):
     last_error_message: Mapped[str | None] = mapped_column(Text)
     # ORM optimistic locking only. Never the fence: the trigger bumps it on heartbeats.
     lock_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class JobBatch(Base, TimestampMixin):
+    """A group of jobs submitted in one request.
+
+    ``total_jobs`` is written once, at creation, inside the same transaction as the
+    children. Progress is a GROUP BY status over ix_jobs_batch rather than a
+    maintained counter, so there is nothing to drift and nothing to reconcile.
+
+    There is deliberately no ``fail_fast``: honouring it would require a per-batch
+    check on the hot claim path, and a validated-but-inert field is worse than an
+    absent one.
+    """
+
+    __tablename__ = "job_batches"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["queue_id", "project_id"],
+            ["queues.id", "queues.project_id"],
+            ondelete="CASCADE",
+            name="fk_job_batches_queue",
+        ),
+        CheckConstraint("total_jobs BETWEEN 1 AND 1000", name="total_jobs_range"),
+        Index("ix_job_batches_project_created", "project_id", text("created_at DESC")),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid7)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(nullable=False)
+    queue_id: Mapped[UUID] = mapped_column(nullable=False)
+    name: Mapped[str | None] = mapped_column(String(200))
+    handler: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Set at creation, in the same transaction as the children.
+    total_jobs: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class JobSchedule(Base, TimestampMixin):
+    """A recurrence rule. Not a job.
+
+    One schedule materialises many jobs; jobs.schedule_id + jobs.scheduled_for links
+    them, and ux_jobs_schedule_occurrence is what makes N schedulers safe.
+
+    The columns from ``handler`` down are the job template the cron dispatcher copies
+    onto each occurrence -- a schedule has to know what to enqueue.
+    """
+
+    __tablename__ = "job_schedules"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["queue_id", "project_id"],
+            ["queues.id", "queues.project_id"],
+            ondelete="CASCADE",
+            name="fk_job_schedules_queue",
+        ),
+        CheckConstraint(f"catchup_policy IN ({_CATCHUP_POLICIES})", name="catchup_policy_valid"),
+        CheckConstraint("max_catchup_occurrences BETWEEN 1 AND 1000", name="max_catchup_range"),
+        CheckConstraint("priority BETWEEN -100 AND 100", name="priority_range"),
+        CheckConstraint("max_attempts BETWEEN 1 AND 50", name="max_attempts_range"),
+        # Deletion is soft, so uniqueness must be too -- otherwise a deleted schedule
+        # permanently reserves its name.
+        Index(
+            "ux_job_schedules_queue_name",
+            "queue_id",
+            "name",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+        # The cron dispatcher's exact predicate.
+        Index(
+            "ix_job_schedules_due",
+            "next_occurrence_at",
+            postgresql_where=text("is_active AND deleted_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid7)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(nullable=False)
+    queue_id: Mapped[UUID] = mapped_column(nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+
+    cron: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Stored per schedule; croniter's timezone-aware iteration handles DST.
+    timezone: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="UTC", server_default=text("'UTC'")
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    # Advanced from the nominal scheduled_for, never from now(), so a slow tick can
+    # never shift the schedule.
+    next_occurrence_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_occurrence_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 'skip' (default) advances past a backlog after downtime; 'catchup' fires up to
+    # max_catchup_occurrences.
+    catchup_policy: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="skip", server_default=text("'skip'")
+    )
+    max_catchup_occurrences: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=10, server_default=text("10")
+    )
+    # Incremented instead of materialising an occurrence into a paused queue, so a
+    # paused per-minute schedule cannot silently accumulate a stampede.
+    skipped_occurrences: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    # Soft delete: occurrences already materialised keep a live parent, which is what
+    # jobs.schedule_id ON DELETE RESTRICT requires.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # --- Job template ---
+    handler: Mapped[str] = mapped_column(String(200), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    priority: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=0, server_default=text("0")
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=3, server_default=text("3")
+    )
+    timeout_ms: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60_000, server_default=text("60000")
+    )
