@@ -14,7 +14,9 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.domain.errors import DomainError
 
 
-def envelope(code: str, message: str, request_id: str, details: list[Any] | None = None) -> dict:
+def envelope(
+    code: str, message: str, request_id: str, details: list[Any] | None = None
+) -> dict[str, Any]:
     return {
         "error": {
             "code": code,

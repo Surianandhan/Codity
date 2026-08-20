@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     )
 
     database_url: PostgresDsn = Field(
-        default="postgresql+asyncpg://localhost/codity",  # type: ignore[arg-type]
+        default=PostgresDsn("postgresql+asyncpg://localhost/codity"),
         description="asyncpg DSN",
     )
     db_pool_size: int = 10

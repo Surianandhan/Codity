@@ -47,7 +47,7 @@ class WorkerRunner:
 
         self.worker_id: UUID | None = None
         self._stopping = asyncio.Event()
-        self._inflight: dict[UUID, asyncio.Task] = {}
+        self._inflight: dict[UUID, asyncio.Task[None]] = {}
         # Claimed but not yet started: these can be released for free on shutdown,
         # because attempt only increments at claimed -> running.
         self._unstarted: dict[UUID, int] = {}

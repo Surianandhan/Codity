@@ -24,7 +24,7 @@ def uuid7() -> UUID:
 
 
 class Base(DeclarativeBase):
-    metadata = MetaData(naming_convention=NAMING_CONVENTION)  # type: ignore[arg-type]
+    metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
     def __repr__(self) -> str:
         pk: Any = getattr(self, "id", None)

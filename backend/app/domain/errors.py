@@ -1,11 +1,15 @@
+
+
 """Domain errors. The API layer maps these to HTTP; nothing else raises HTTPException."""
+
+from typing import Any
 
 
 class DomainError(Exception):
     code = "internal_error"
     http_status = 500
 
-    def __init__(self, message: str, details: list[dict] | None = None) -> None:
+    def __init__(self, message: str, details: list[dict[str, Any]] | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.details = details or []

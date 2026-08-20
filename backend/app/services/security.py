@@ -44,7 +44,7 @@ def create_access_token(user_id: UUID, org_id: UUID, role: str, token_version: i
         "exp": now + timedelta(minutes=s.access_token_ttl_minutes),
         "typ": "access",
     }
-    return jwt.encode(payload, s.jwt_secret, algorithm=s.jwt_algorithm)
+    return str(jwt.encode(payload, s.jwt_secret, algorithm=s.jwt_algorithm))
 
 
 def create_refresh_token(user_id: UUID) -> tuple[str, str, datetime]:
@@ -53,10 +53,12 @@ def create_refresh_token(user_id: UUID) -> tuple[str, str, datetime]:
     now = datetime.now(UTC)
     jti = uuid4().hex
     expires = now + timedelta(days=s.refresh_token_ttl_days)
-    token = jwt.encode(
-        {"sub": str(user_id), "jti": jti, "iat": now, "exp": expires, "typ": "refresh"},
-        s.jwt_secret,
-        algorithm=s.jwt_algorithm,
+    token = str(
+        jwt.encode(
+            {"sub": str(user_id), "jti": jti, "iat": now, "exp": expires, "typ": "refresh"},
+            s.jwt_secret,
+            algorithm=s.jwt_algorithm,
+        )
     )
     return token, jti, expires
 
@@ -64,7 +66,7 @@ def create_refresh_token(user_id: UUID) -> tuple[str, str, datetime]:
 def decode_token(token: str, expected_type: str = "access") -> dict[str, Any]:
     s = get_settings()
     try:
-        claims = jwt.decode(token, s.jwt_secret, algorithms=[s.jwt_algorithm])
+        claims: dict[str, Any] = jwt.decode(token, s.jwt_secret, algorithms=[s.jwt_algorithm])
     except JWTError as exc:
         raise PermissionDenied("invalid or expired token") from exc
     if claims.get("typ") != expected_type:

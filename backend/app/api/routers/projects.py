@@ -2,6 +2,7 @@ from uuid import UUID
 
 from fastapi import APIRouter
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import MemberDep, PrincipalDep, SessionDep
 from app.api.schemas import ProjectIn, ProjectOut, QueueIn, QueueOut
@@ -102,7 +103,9 @@ async def resume_queue(queue_id: UUID, principal: MemberDep, session: SessionDep
     return await _set_paused(session, queue_id, principal.organization_id, False)
 
 
-async def _set_paused(session, queue_id: UUID, org_id: UUID, paused: bool) -> Queue:  # type: ignore[no-untyped-def]
+async def _set_paused(
+    session: AsyncSession, queue_id: UUID, org_id: UUID, paused: bool
+) -> Queue:
     from datetime import UTC, datetime
 
     queue = (

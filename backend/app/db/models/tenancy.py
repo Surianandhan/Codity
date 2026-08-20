@@ -84,7 +84,7 @@ class RefreshToken(Base):
     user_agent: Mapped[str | None] = mapped_column(Text)
     ip: Mapped[str | None] = mapped_column(String(45))
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default="now()"
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
 
 

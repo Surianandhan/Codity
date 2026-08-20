@@ -24,7 +24,7 @@ def _slugify(name: str) -> str:
     return "".join(c if c.isalnum() else "-" for c in name.lower()).strip("-")[:100] or "org"
 
 
-async def _issue(session: SessionDep, user: User, org_id: UUID, role: str) -> TokenOut:  # type: ignore[name-defined]
+async def _issue(session: SessionDep, user: User, org_id: UUID, role: str) -> TokenOut:
     access = create_access_token(user.id, org_id, role, user.token_version)
     refresh, jti, expires = create_refresh_token(user.id)
     session.add(RefreshToken(jti=jti, user_id=user.id, expires_at=expires))
