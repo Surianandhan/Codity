@@ -7,7 +7,7 @@ from sqlalchemy import text
 
 from app.api.errors import register_error_handlers
 from app.api.middleware.request_context import RequestContextMiddleware
-from app.api.routers import auth, jobs, projects
+from app.api.routers import auth, dlq, jobs, metrics, projects, schedules, system, workers
 from app.config import get_settings
 from app.db.session import get_engine
 
@@ -53,7 +53,17 @@ def create_app() -> FastAPI:
     )
     register_error_handlers(app)
 
-    for r in (auth.router, projects.router, jobs.router):
+    routers = (
+        auth.router,
+        projects.router,
+        jobs.router,
+        schedules.router,
+        workers.router,
+        dlq.router,
+        metrics.router,
+        system.router,
+    )
+    for r in routers:
         app.include_router(r, prefix="/api/v1")
 
     @app.get("/healthz", tags=["system"])
