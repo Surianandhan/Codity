@@ -149,47 +149,121 @@ export interface WorkerRow {
   status: WorkerStatus | string
   concurrency?: number | null
   last_heartbeat_at: string | null
+  /**
+   * Heartbeat age measured by `now()` in Postgres. Liveness is never re-derived
+   * from the browser clock: that would make fleet health depend on NTP agreement
+   * between the operator's laptop and the database.
+   */
+  heartbeat_age_seconds: number | null
+  /** Server-computed against LIVENESS_GRACE_SECONDS (150s). */
+  is_live: boolean
   drain_requested?: boolean
   started_at?: string | null
-  /** Server-side count of claimed+running jobs, when the API supplies it. */
-  active_jobs?: number | null
+  /** Claimed + running jobs held by this worker. */
+  inflight: number
 }
 
-export interface QueueStats {
-  queue_id?: string
-  scheduled: number
-  queued: number
-  claimed: number
-  running: number
-  completed?: number
-  failed?: number
-  dead_letter?: number
-}
+/** The metrics window vocabulary; anything else is a 422 from the API. */
+export const METRICS_WINDOWS = ['15m', '1h', '6h', '24h', '7d'] as const
+export type MetricsWindow = (typeof METRICS_WINDOWS)[number]
 
-export interface MetricsSummary {
+export const METRICS_BUCKETS = ['1m', '5m', '15m', '1h'] as const
+export type MetricsBucket = (typeof METRICS_BUCKETS)[number]
+
+/**
+ * Depth comes from `ix_jobs_depth`, a partial index over the LIVE statuses only,
+ * so terminal counts — `dead_letter` above all — are structurally absent here.
+ * Read those from the window rollup (`dead_lettered`) or from `dlq_open`.
+ */
+export type DepthCounts = Partial<Record<'scheduled' | 'queued' | 'claimed' | 'running', number>>
+
+/** The window rollup fields shared by the summary and queue-stats responses. */
+export interface WindowRollup {
+  enqueued: number
   completed: number
   failed: number
-  dead_letter: number
-  running: number
-  queued: number
-  scheduled?: number
+  dead_lettered: number
+  retried: number
   /** Mean, not p50 — the rollup stores sums, percentiles need a second pass. */
-  avg_duration_ms?: number | null
+  mean_duration_ms: number | null
+  max_duration_ms: number
 }
 
-export interface ThroughputPoint {
-  bucket: string
-  completed: number
-  failed: number
-  dead_letter: number
+export interface QueueStats extends WindowRollup {
+  queue_id: string
+  name: string
+  is_paused: boolean
+  max_concurrency: number
+  depth: DepthCounts
+  /** Server-computed claimed + running; do not recompute it client-side. */
+  inflight: number
+  /** What a claim would be allowed to take right now: max_concurrency - inflight. */
+  headroom: number
+  oldest_queued_age_seconds: number | null
+  window: MetricsWindow
+}
+
+export interface MetricsSummary extends WindowRollup {
+  project_id: string
+  window: MetricsWindow
+  depth: DepthCounts
+  success_rate: number | null
+  /** Unresolved dead-letter entries — a level, not a windowed count. */
+  dlq_open: number
+  oldest_overdue_seconds: number | null
+}
+
+export interface ThroughputPoint extends WindowRollup {
+  bucket_start: string
+}
+
+export interface Fleet {
+  total: number
+  live: number
+  stale: number
+  draining: number
+  inflight: number
+}
+
+export interface OverdueScheduled {
+  job_id: string
+  run_at: string
+  age_seconds: number
+}
+
+export interface SchedulerLoop {
+  name: string
+  last_run_at: string
+  age_seconds: number
+  is_stale: boolean
+  last_error: string | null
 }
 
 export interface SystemStatus {
-  workers_total: number
-  workers_live: number
+  healthy: boolean
+  fleet: Fleet
+  /** null when nothing is overdue — the healthy case, not missing data. */
+  oldest_overdue_scheduled: OverdueScheduled | null
   dlq_depth: number
-  oldest_overdue_seconds: number | null
-  scheduler_last_tick_age_seconds: number | null
+  /** One row per scheduler loop (promoter, reaper, …), cluster-wide. */
+  scheduler: SchedulerLoop[]
+}
+
+/**
+ * The fleet's worst-case tick age: the API reports one row per scheduler loop,
+ * and the health of the set is the health of its laggiest member. `null` means
+ * no loop has ever reported — which is itself worth rendering as "unknown"
+ * rather than as a number.
+ */
+export function schedulerTickAgeSeconds(status: SystemStatus | undefined): number | null {
+  const loops = status?.scheduler
+  if (!loops || loops.length === 0) return null
+  return Math.max(...loops.map((loop) => loop.age_seconds))
+}
+
+/** Live depth that is actually executing or about to: claimed + running. */
+export function inflightOf(depth: DepthCounts | undefined): number {
+  return (depth?.claimed ?? 0) + (depth?.running ?? 0)
 }
 
 /** Cursor page envelope. `total` is deliberately absent — counts come from /stats. */

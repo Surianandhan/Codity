@@ -64,8 +64,20 @@ LIVE_STATUSES = frozenset(
     {JobStatus.SCHEDULED, JobStatus.QUEUED, JobStatus.CLAIMED, JobStatus.RUNNING}
 )
 
-# The state machine, as data. Mirrored by job_status_transitions in the DB;
-# tests/test_state_machine.py asserts the two agree.
+# The state machine, as data -- the diagram in docs/DATABASE.md section 5 transcribed.
+#
+# Referenced by nothing. There is no job_status_transitions table and no trigger:
+# the schema contains no triggers at all. Enforcement is Python-side only, and it
+# is per-statement rather than central -- every transition is a guarded UPDATE
+# whose WHERE names the source status (claim_jobs.sql matches status='queued',
+# start_job.sql matches 'claimed', complete_job.sql and fail_job.sql match
+# 'running'), and every caller checks the rowcount. An illegal edge does not
+# raise; it updates zero rows.
+#
+# So this set is documentation in executable form, and nothing keeps it honest.
+# Drift between it and the .sql files is possible and would be silent. Closing
+# that means either a BEFORE UPDATE trigger asserting these edges, or a test
+# parsing the source status out of each statement -- neither is written.
 LEGAL_TRANSITIONS: frozenset[tuple[JobStatus, JobStatus]] = frozenset(
     {
         (JobStatus.SCHEDULED, JobStatus.QUEUED),

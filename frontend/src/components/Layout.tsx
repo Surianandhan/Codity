@@ -2,9 +2,12 @@ import { Link, NavLink, useNavigate } from 'react-router-dom'
 import type { ReactNode } from 'react'
 import { useAuth } from '../hooks/useAuth'
 import { useProjects, useSystemStatus } from '../hooks/queries'
+import { schedulerTickAgeSeconds } from '../types'
 
+/** `== null` catches undefined as well as null; `=== null` did not, and
+ * Math.round(undefined) is how a header renders the word "NaN". */
 function healthTone(seconds: number | null | undefined): string {
-  if (seconds === null || seconds === undefined) return 'text-ink-400'
+  if (seconds == null) return 'text-ink-400'
   if (seconds > 30) return 'text-rose-300'
   if (seconds > 10) return 'text-amber-300'
   return 'text-emerald-300'
@@ -17,6 +20,8 @@ export function Layout({ children }: { children: ReactNode }) {
   const status = useSystemStatus()
 
   const firstProject = projects.data?.[0]
+  // One row per scheduler loop; the set is as healthy as its laggiest member.
+  const tickAge = schedulerTickAgeSeconds(status.data)
 
   return (
     <div className="min-h-screen bg-ink-950 text-ink-100">
@@ -55,17 +60,14 @@ export function Layout({ children }: { children: ReactNode }) {
                 <span>
                   fleet{' '}
                   <span className="text-ink-100">
-                    {status.data.workers_live}/{status.data.workers_total}
+                    {status.data.fleet.live}/{status.data.fleet.total}
                   </span>
                 </span>
                 <span>
                   DLQ <span className="text-ink-100">{status.data.dlq_depth}</span>
                 </span>
-                <span className={healthTone(status.data.scheduler_last_tick_age_seconds)}>
-                  scheduler tick{' '}
-                  {status.data.scheduler_last_tick_age_seconds === null
-                    ? 'unknown'
-                    : `${Math.round(status.data.scheduler_last_tick_age_seconds)}s ago`}
+                <span className={healthTone(tickAge)}>
+                  scheduler tick {tickAge == null ? 'unknown' : `${Math.round(tickAge)}s ago`}
                 </span>
               </>
             ) : null}

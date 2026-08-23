@@ -29,7 +29,6 @@ graph TB
     subgraph API["api process (N)"]
         R["Routers /api/v1"]
         S["Services"]
-        Repo["Repositories"]
     end
     subgraph SCH["scheduler process (N)"]
         P["Promoter: scheduled to queued"]
@@ -49,8 +48,8 @@ graph TB
     UI --> R
     CLI --> R
     R --> S
-    S --> Repo
-    Repo --> PG
+    R --> PG
+    S --> PG
     P --> PG
     C --> PG
     RE --> PG
@@ -85,14 +84,21 @@ whether an invariant breaks. This one does not.
 
 ### Worker identity and queue subscription
 
-A worker connects to Postgres directly, so it must be told which tenant it serves: `--org <uuid>`
-(or `CODITY_ORG_ID`) is validated at startup. `--queues` takes `project-slug/queue-name` pairs,
-because queue names are unique per project and not globally.
+A worker connects to Postgres directly, so it must be told which tenant it serves: **`--org <uuid>`
+is a required CLI argument**, and it is the only way to pass the tenant. There is deliberately no
+`CODITY_ORG_ID` environment variable — and exporting one would be actively harmful, because
+`config.py` uses `env_prefix="CODITY_"` with `extra="forbid"`, so any unrecognised `CODITY_*` name in
+the environment raises a `ValidationError` that takes down the API, the worker and the scheduler
+alike. `--queues` takes `project-slug/queue-name` pairs, because queue names are unique per project
+and not globally.
 
 On boot the worker upserts its `workers` row keyed on `(organization_id, name)` where the default
-name is `{hostname}-{pid}`, and populates `worker_queue_assignments`. A retention rule deletes
-`workers` rows in status `dead`/`stopped` older than 24h, so restarts do not leave the fleet screen
-full of corpses.
+name is `{hostname}-{pid}`. A retention rule deletes `workers` rows in status `dead`/`stopped` older
+than 24h, so restarts do not leave the fleet screen full of corpses.
+
+Queue subscription is **not persisted**: there is no `worker_queue_assignments` table, so the
+database cannot answer "which workers serve this queue". The dashboard therefore cannot distinguish a
+queue with no workers from an idle queue — see the deferred list in [`../README.md`](../README.md).
 
 Per polling cycle the worker iterates its queues in **weighted-random order by `queues.priority`**,
 issuing one claim statement per queue and capping each queue's share at `ceil(batch_size /
@@ -109,33 +115,39 @@ Codity/
 │   ├── app/
 │   │   ├── main.py                  # FastAPI app factory
 │   │   ├── config.py                # pydantic-settings, CODITY_ prefix
-│   │   ├── domain/                  # FastAPI-free: enums, errors, backoff, cron
+│   │   ├── domain/                  # FastAPI-free: enums.py, errors.py, backoff.py
 │   │   ├── db/
 │   │   │   ├── session.py
-│   │   │   ├── models/              # SQLAlchemy models, one module per cluster
+│   │   │   ├── models/              # base, tenancy, scheduling, execution, observability
 │   │   │   └── sql/                 # raw .sql for the hot path
-│   │   │       ├── claim_jobs.sql
+│   │   │       ├── lock_queue.sql   # step 1 of the claim -- see ADR-003
+│   │   │       ├── claim_jobs.sql   # step 2
 │   │   │       ├── start_job.sql
 │   │   │       ├── complete_job.sql
 │   │   │       ├── fail_job.sql
 │   │   │       ├── reap_leases.sql
 │   │   │       ├── promote_due.sql
 │   │   │       └── heartbeat.sql
-│   │   ├── repositories/
-│   │   ├── services/                # jobs, queues, claim, idempotency
+│   │   ├── services/                # jobs, claim, idempotency, reliability, security
 │   │   ├── api/
 │   │   │   ├── deps.py              # auth, scope resolution
 │   │   │   ├── errors.py            # exception handlers, one envelope
+│   │   │   ├── pagination.py        # keyset cursors
+│   │   │   ├── schemas.py           # every request/response model
 │   │   │   ├── middleware/request_context.py
-│   │   │   └── routers/             # auth, projects, queues, jobs, workers, dlq, metrics
+│   │   │   └── routers/             # auth, projects, jobs, schedules, workers, dlq,
+│   │   │                            #   metrics, system
 │   │   ├── worker/
-│   │   │   ├── main.py              # CLI entrypoint
+│   │   │   ├── main.py              # CLI entrypoint (--org is required)
 │   │   │   ├── runner.py            # claim loop, executor pool, heartbeat, drain
 │   │   │   ├── logsink.py           # the only writer of job_logs
-│   │   │   └── handlers/            # echo, sleep, http_request, flaky, cpu_burn
-│   │   └── scheduler/main.py        # promoter, cron, reaper, sweeps
-│   ├── alembic/versions/
-│   ├── scripts/                     # seed.py, demo_load.py, export_openapi.py
+│   │   │   └── handlers/            # demo.echo, demo.sleep, demo.flaky,
+│   │   │                            #   demo.always_fail, demo.cpu
+│   │   └── scheduler/
+│   │       ├── main.py              # process entrypoint
+│   │       └── loops.py             # promoter, reaper, cron, dead-worker, retention
+│   ├── alembic/versions/            # five revisions, hash-named -- DATABASE.md §9
+│   ├── scripts/                     # seed.py, demo_load.py
 │   ├── tests/
 │   └── pyproject.toml
 ├── frontend/
@@ -153,23 +165,35 @@ ORM owns CRUD, where its ergonomics pay off and its generated SQL does not matte
 
 ## 3. The layering rule
 
+Three layers, not four:
+
 ```
-routers → services → repositories → models
+routers → services → models
 ```
 
 over a FastAPI-free `domain/`.
 
 - `domain/` imports nothing from `app.api`, `app.db`, or `fastapi`. It is pure: enums, errors,
-  backoff arithmetic, cron helpers.
-- `services/` and `repositories/` never import `fastapi`. **This is what lets the worker and the
-  scheduler reuse `services/claim.py` without dragging in the web framework** — the rule exists for
-  that specific reason, not as decoration.
-- Routers hold no business logic; they translate HTTP to service calls and back.
+  backoff arithmetic. (Cron parsing is **not** here — it lives in `scheduler/loops.py`, which is the
+  only caller.)
+- `services/` never imports `fastapi`. **This is what lets the worker and the scheduler reuse
+  `services/claim.py` without dragging in the web framework** — the rule exists for that specific
+  reason, not as decoration, and the concurrency tests import the same module the worker does.
+- Routers hold no business logic. They do, however, **issue `select()` directly** for reads: there
+  is no repository layer between a router and the ORM.
 - Nothing outside `app/api/` raises `HTTPException`. Services raise `DomainError` subclasses, and
   `app/api/errors.py` is the only place that knows about status codes.
 
-A test walks the AST of every module under `backend/app/` and asserts these import rules, so the
-layering is **enforced rather than aspirational**. A layering rule nobody checks is a comment.
+**On `app/repositories/`:** the package exists and is **empty** — a zero-byte `__init__.py` and
+nothing else. It is a placeholder for a repository layer that was planned and not built. Read reuse
+across routers is currently duplication, and extracting it is the natural next refactor; until then,
+treating the tree as three layers is the accurate reading.
+
+**These rules are stated intent, not machine-checked.** No test walks the AST asserting them, so
+nothing stops a future edit from importing `fastapi` into `services/`. The rule that matters most —
+`services/claim.py` staying framework-free — is at least exercised indirectly: the worker process
+and the concurrency tests both import it without FastAPI present, so breaking it breaks `make test`.
+An explicit `test_layering_rules` that walks the imports is the honest fix, and it is not written.
 
 ---
 
@@ -206,7 +230,7 @@ boundaries, without a tracing backend.
 | Endpoint | Answers |
 |---|---|
 | `GET /healthz` | Is the process alive? No I/O. |
-| `GET /readyz` | Is the database reachable and are migrations current? |
+| `GET /readyz` | Is the database reachable? It opens a connection and runs `select 1`. It does **not** check that migrations are current — a schema-version probe is not implemented. |
 | `GET /api/v1/system/status` | Worker count live/dead, oldest overdue scheduled job, DLQ depth, **scheduler last-tick age**. |
 
 **Cross-process staleness.** The last-tick age needs a home in the database, because the API and the
@@ -215,19 +239,37 @@ report it. A four-column table solves it:
 
 ```sql
 CREATE TABLE system_state (
-    name        text PRIMARY KEY,   -- 'promoter' | 'cron' | 'reaper' | 'retention'
+    name        text PRIMARY KEY,   -- 'promoter' | 'reaper' | 'cron' | 'dead_worker' | 'retention'
     last_run_at timestamptz NOT NULL,
     last_error  text,
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 ```
 
-Every scheduler loop upserts its row on every tick. This converts the system's biggest silent-failure
-mode — **a dead promoter, which stalls every delayed job *and* every backoff retry while immediate
-jobs keep flowing perfectly** — from an invisible outage into a number on the dashboard. It is the
-one failure that looks like nothing is wrong.
+All five scheduler loops upsert their row on every tick. This converts the system's biggest
+silent-failure mode — **a dead promoter, which stalls every delayed job *and* every backoff retry
+while immediate jobs keep flowing perfectly** — from an invisible outage into a number on the
+dashboard. It is the one failure that looks like nothing is wrong.
 
-**Metrics.** `queue_stats_minute` is a per-minute rollup (`enqueued`, `completed`, `failed`,
-`dead_lettered`, `sum_duration_ms`, `max_duration_ms`) written by the scheduler. The throughput
-chart reads the rollup, not `jobs` — a dashboard that aggregates the hot table is a dashboard that
-competes with the claim path for the same pages.
+**Metrics.** The throughput and summary endpoints aggregate `jobs` and `job_executions`
+**directly**, bucketed by minute with `date_trunc` and gap-filled with `generate_series` so an idle
+minute returns an explicit zero rather than a missing row. Enqueues bucket by `jobs.created_at`,
+terminal outcomes by `jobs.finished_at`, and durations by `job_executions.finished_at`; `retried`
+counts executions with `attempt_number > 1`.
+
+Aggregating the source tables was chosen over a pre-computed rollup deliberately. A rollup is a
+second source of truth: it can drift from the tables it summarises, it needs a backfill for history
+predating it, and it needs its own tests to prove it has not drifted. Reading the source tables is
+correct by construction. The cost is that a throughput request scans a slice of `jobs` and
+`job_executions` rather than a small rollup — bounded by `ix_jobs_project_created`,
+`ix_jobs_queue_status_created` and `ix_job_executions_job`, and by the window itself. **Revisit if**
+a metrics request starts competing with the claim path for the same pages; at that point a rollup
+loop folding closed `job_executions` into minute buckets becomes worth its consistency cost.
+
+`mean_duration_ms` and `success_rate` return `null` rather than `0` when a window contains nothing
+measurable. A zero would assert "no time elapsed" and "nothing succeeded", which is a different
+claim from "there is nothing here".
+
+**`queue_stats_minute` is vestigial.** The table still exists (migration `eb052146b351`) and
+`scripts/seed.py` backfills it, but nothing in the application reads it. It is a leftover of the
+rollup design described above, and a candidate for removal.

@@ -354,12 +354,19 @@ async def test_claim_cap_holds_when_a_claimer_waits_on_the_queue_lock(
     what B computes *after* the lock is released: the cap is exact only if B's
     in-flight count sees A's three claims.
 
-    Under READ COMMITTED a statement keeps the snapshot it took when it started.
-    Releasing a row lock re-checks the *locked row* (EvalPlanQual); it does not give
-    the rest of the statement a newer snapshot, so the ``count(*)`` over ``jobs``
-    inside ``headroom`` is still the pre-A count. That is the check-then-act race
-    the queue-row lock was supposed to close, and it is still open -- it has simply
-    been serialised.
+    This test found a real bug, and the assertions below are what it looks like
+    fixed. Under READ COMMITTED a statement keeps the snapshot it took when it
+    started. Releasing a row lock re-checks only the *locked row* (EvalPlanQual); it
+    does not hand the rest of the statement a newer snapshot. So when the lock and
+    the ``headroom`` count lived in the SAME statement, B's ``count(*)`` over
+    ``jobs`` was still the pre-A count -- the check-then-act race the queue-row lock
+    was supposed to close, merely serialised.
+
+    The fix is the reason ``lock_queue.sql`` is a separate file: the lock is issued
+    as its own statement before ``claim_jobs.sql``, in the same transaction. A new
+    statement takes a new snapshot, and it takes it once the lock already held makes
+    that snapshot safe to act on. B therefore sees A's three claims, computes zero
+    headroom, and claims nothing -- which is what is asserted below.
     """
     scope = await seed_scope(sessionmaker_, max_concurrency=3)
     await seed_jobs(sessionmaker_, scope, 20)
@@ -724,11 +731,12 @@ async def test_start_rowcount_zero_means_do_not_run(sessionmaker_: Sessions) -> 
 
     epoch_a = await claim_one(sessionmaker_, scope, worker_a, job_id)
 
-    # Graceful shutdown releases it back to 'queued'. The execution row is closed
-    # here too -- that is what a correct release has to do, and the fact that the
-    # shipped release path does not is asserted separately by
-    # test_released_claim_can_be_claimed_again. Closing it here keeps this test
-    # about the start guard and nothing else.
+    # Graceful shutdown releases it back to 'queued'. The release is written out
+    # by hand here rather than driven through WorkerRunner.shutdown() so that this
+    # test exercises the start guard and nothing else. It closes the execution row
+    # because that is what a correct release does -- and what the shipped release
+    # path does: test_released_claim_can_be_claimed_again asserts exactly that,
+    # against the real runner.
     async with sessionmaker_() as s:
         await s.execute(
             text(

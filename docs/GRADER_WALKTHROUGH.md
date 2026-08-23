@@ -9,7 +9,9 @@
 > no worker running, the dashboard shows a job that never moves, and the system looks broken when it
 > is behaving exactly as specified.
 >
-> Three processes, three terminals: **`make api`**, **`make worker`**, **`make scheduler`**.
+> Three backend processes, three terminals: **`make api`**, **`make worker`**, **`make scheduler`**.
+> The dashboard is a fourth terminal and is optional — every step below can also be driven from
+> Swagger.
 >
 > The `scheduler` matters too: without it, *immediate* jobs still flow perfectly while every
 > *delayed* job, every *cron* occurrence, and **every backoff retry** silently stalls. That is the
@@ -26,7 +28,7 @@ Each step names the rubric row it is evidence for.
 ### 1 · Start the system — 90s
 > **System Architecture**
 
-Four terminals:
+Three backend processes, plus the dashboard:
 
 ```bash
 make api
@@ -84,9 +86,15 @@ make demo
 ```
 
 500 jobs across 3 queues with a handler that fails about 20% of the time. Watch the throughput chart
-move, and watch failed jobs retry with **visibly increasing gaps** — that is full-jitter exponential
-backoff, and the reason retries go to `scheduled` rather than straight back to `queued`
-([ADR-006](DESIGN_DECISIONS.md)). Some jobs exhaust their attempts and land in the DLQ.
+move and the queue depth drain on the project page, and watch failed jobs retry with **visibly
+increasing gaps** — that is full-jitter exponential backoff, and the reason retries go to `scheduled`
+rather than straight back to `queued` ([ADR-006](DESIGN_DECISIONS.md)). Some jobs exhaust their
+attempts and land in the DLQ.
+
+Every number on that page is aggregated from `jobs` and `job_executions` at request time — there is
+no rollup table in front of them, so nothing on the dashboard can be stale in a way the source
+tables are not. Empty minutes are gap-filled in SQL, so an outage renders as a **gap** in the line
+rather than as a zero, which is the one reading the chart exists to make obvious.
 
 `make demo` prints an invariant block at the end:
 
@@ -142,12 +150,26 @@ described in [ADR-004](DESIGN_DECISIONS.md).
 ### 6 · Pause a queue — 45s
 > **Backend Engineering · Database Design**
 
-Toggle pause on a busy queue from the dashboard (or `POST /api/v1/queues/{id}/pause`).
+On the project page, the queue table carries a **Pause** / **Resume** button per row. Click it on a
+busy queue while `make demo` is still draining. Or open the queue itself — click its row — for the
+**Pause admission** / **Resume admission** button in the queue screen's header. Either is
+`POST /api/v1/queues/{id}/pause` and `/resume` underneath.
 
-Claims stop immediately; **in-flight jobs finish**. The UI reads "paused — N still running". Pause
-blocks admission only, and the cron dispatcher will not materialise occurrences into a paused queue —
-otherwise a paused queue with a per-minute schedule quietly accumulates a backlog that stampedes on
-resume.
+While paused with work still running, the queue screen's header shows a badge reading
+**"paused — N still running"**, where N is the live in-flight count; once the last one finishes the
+badge reads just "paused". That badge *is* the point of the step: claims stop immediately, but
+**in-flight jobs finish**. The **config** tab on the same screen shows `is_paused`, `inflight`,
+`headroom` and `max_concurrency` as the server computes them.
+
+One thing to know before you deep-link: the queue screen is reached by clicking through from a
+project, because there is no `GET /queues/{id}` for it to recover its project from a bare queue id
+([`API.md`](API.md) §1). Pasting a `/queues/<uuid>` URL cold still works — it just omits the
+back-link rather than faking one.
+
+Pause blocks admission only, and the cron dispatcher will not materialise occurrences into a paused
+queue — it increments `skipped_occurrences` instead. Otherwise a paused queue with a per-minute
+schedule quietly accumulates a backlog that stampedes on resume. That behaviour is pinned by
+`test_cron_does_not_materialise_into_a_paused_queue`.
 
 `is_paused` and `paused_at` are written together, enforced by
 `CHECK (is_paused = (paused_at IS NOT NULL))`. The database will not hold a half-paused queue.
@@ -157,12 +179,17 @@ resume.
 ### 7 · Replay from the dead letter queue — 45s
 > **Backend Engineering · Frontend & UX**
 
-Filter the job explorer to `?status=dead_letter` and hit **Replay**.
+Pick the **Dead letter** saved filter on the job explorer (`?status=dead_letter`), then **click a
+row** to open the job and hit **Replay** there. Replay lives on the job detail screen, one job at a
+time — the explorer lists dead-lettered jobs but carries no replay button and no multi-select, so
+bulk replay is API-only today (`POST /api/v1/dlq/{entry_id}/replay`). The button is disabled unless
+the job is terminal, and the server answers `409` for a non-terminal job regardless.
 
 Replay inserts a **new** job with `replay_of_job_id` pointing at the original — it does not mutate
 the terminal job. Terminal states have zero out-edges, so history stays immutable and the original
-failure remains inspectable ([ADR-009](DESIGN_DECISIONS.md)). Note that the replayed job succeeds
-even if the original carried an `Idempotency-Key`: the unique index is scoped to *live* statuses.
+failure remains inspectable ([ADR-009](DESIGN_DECISIONS.md)). The replayed job should succeed even
+if the original carried an `Idempotency-Key`, because `ux_jobs_live_idempotency` is scoped to *live*
+statuses — worth trying by hand, since no test asserts it ([`TESTING.md`](TESTING.md) §3).
 
 The DLQ is a saved filter on the job explorer rather than a sixth route — same data, one fewer screen
 to maintain.
@@ -172,8 +199,10 @@ to maintain.
 ### 8 · Exact concurrency caps — 45s
 > **Reliability & Concurrency · Database Design**
 
-Set a queue's `max_concurrency` to 3 and push load at it. Sample in-flight count — it never exceeds
-3, not "usually 3".
+Use the **`bulk`** queue, which `scripts/seed.py` ships with `max_concurrency = 3` for exactly this
+step — there is no `PATCH /queues/{id}`, so queue configuration is set at seed time or in `psql`,
+not from the API. Push load at it and sample the in-flight count on the queue screen (or the
+`inflight` field of `GET /api/v1/queues/{id}/stats`): it never exceeds 3, not "usually 3".
 
 This is exact rather than approximate because the claim statement takes a **`FOR NO KEY UPDATE`**
 lock on the `queues` row before computing headroom. The obvious alternative — count in flight, then

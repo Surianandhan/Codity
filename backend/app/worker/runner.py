@@ -15,6 +15,14 @@ What the worker guarantees, and where each guarantee lives:
 * **Failures back off; exhausted budgets dead-letter.** Both decisions are made by
   Postgres inside ``fail_job.sql``. This module never computes a timestamp, so no
   worker's clock can move a retry.
+* **A handler this build does not have is a bounded cost.** The job is released to
+  ``scheduled`` with a backoff rather than to an immediately-claimable ``queued``,
+  and ``unregistered_count`` -- read, not merely written -- dead-letters it once a
+  rolling deploy has had ``UNREGISTERED_MAX_RELEASES`` chances to bring the handler.
+* **The beat follows the leases held, not the queues polled.** Sizing it from the
+  claimable queues lets an operator pausing a short-lease queue expire the lease of
+  a job already running on it, which is a double *execution* that fencing cannot
+  undo -- only a double *commit* is fencing's to prevent.
 
 Cancel and drain ride the heartbeat's ``RETURNING`` clause -- no extra query on the
 hot path. ``ctx.cancelled()`` is the cooperative half; a handler that ignores it is
@@ -40,11 +48,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.db.models.base import uuid7
 from app.db.models.execution import Worker
 from app.db.models.scheduling import Job, Queue
-from app.domain.enums import WorkerStatus
+from app.domain.enums import JobStatus, WorkerStatus
 from app.domain.errors import PermanentError
 from app.services.claim import ClaimedJob, claim_jobs, complete_job, start_job
+from app.services.reliability import LeaseRenewal, heartbeat
 from app.services.reliability import fail_job as fail_job_stmt
-from app.services.reliability import heartbeat
 from app.worker.handlers import REGISTRY, JobContext
 from app.worker.logsink import LogSink, attach_logger
 
@@ -56,6 +64,14 @@ MIN_HEARTBEAT_INTERVAL = 0.5
 # Used until the worker has seen its queues: the shortest lease the schema permits
 # is 10s, so this is deliberately conservative rather than optimistic.
 DEFAULT_LEASE_SECONDS = 30
+
+# How many times one job may be claimed by a worker that does not know its handler
+# before the job is dead-lettered, and the backoff between those releases. Both are
+# READ by _RELEASE_UNREGISTERED below -- a counter nothing reads guards nothing.
+# 5s then 10s gives a rolling deploy room to finish; the third release gives up.
+UNREGISTERED_MAX_RELEASES = 3
+UNREGISTERED_BACKOFF_SEC = 5
+UNREGISTERED_BACKOFF_MAX_SEC = 300
 
 # The open execution row for the attempt we are running. Pinned by lease_epoch, not
 # by "most recent": a reaped-then-reclaimed job has more than one execution row and
@@ -112,6 +128,105 @@ _MARK_TIMED_OUT = text(
     "UPDATE job_executions SET status = 'timed_out'"
     " WHERE job_id = CAST(:jid AS uuid) AND lease_epoch = CAST(:ep AS bigint)"
     " AND status = 'failed'"
+)
+
+# The handler is not in THIS worker's registry (mixed deployment / rolling upgrade).
+# Release without consuming an attempt -- the job provably never ran -- but do three
+# things the previous version of this block did not:
+#
+# 1. FENCE AND GATE THE EXECUTION CLOSE. The close is driven by the jobs UPDATE's
+#    RETURNING set and carries the same lease_epoch, exactly like shutdown()'s
+#    release/close pair. An ungated `WHERE job_id = :jid AND finished_at IS NULL`
+#    closes whatever open row exists -- and after this worker stalls, is reaped, and
+#    the job is re-claimed, that row is the LIVE one belonging to the worker now
+#    running the job. Its successful work would render as a lost attempt with
+#    error_class 'UnregisteredHandler', which is a fabricated failure on another
+#    worker's row.
+# 2. RELEASE TO 'scheduled', NOT 'queued'. The claim query has no run_at predicate --
+#    that is what keeps ix_jobs_claim small -- so 'queued' means "due now" and a job
+#    parked there is re-claimed on the next ~500ms poll. Same reasoning as
+#    fail_job.sql's retry branch.
+# 3. MAKE unregistered_count MEAN SOMETHING. The counter is read back here: the
+#    release that pushes it to UNREGISTERED_MAX_RELEASES dead-letters the job instead
+#    of re-queueing it. Without that terminating condition, a job whose handler no
+#    deployed worker knows is an infinite claim/release loop across the whole fleet.
+#    finished_at is set on that branch because ck_jobs_terminal_finished makes
+#    terminal-status and finished_at equivalent in BOTH directions -- omitting it does
+#    not lose a timestamp, it aborts the transaction.
+_RELEASE_UNREGISTERED = text(
+    """
+    WITH released AS (
+        UPDATE jobs j
+           SET unregistered_count = j.unregistered_count + 1,
+               status = CASE
+                            WHEN j.unregistered_count + 1 >= CAST(:threshold AS int)
+                            THEN 'dead_letter'::job_status
+                            ELSE 'scheduled'::job_status
+                        END,
+               run_at = CASE
+                            WHEN j.unregistered_count + 1 >= CAST(:threshold AS int)
+                            THEN j.run_at
+                            ELSE now() + make_interval(secs => LEAST(
+                                     CAST(:backoff_sec AS numeric)
+                                     * power(2::numeric, j.unregistered_count::numeric),
+                                     CAST(:backoff_max_sec AS numeric)))
+                        END,
+               finished_at = CASE
+                                 WHEN j.unregistered_count + 1 >= CAST(:threshold AS int)
+                                 THEN now()
+                             END,
+               worker_id        = NULL,
+               claimed_at       = NULL,
+               lease_expires_at = NULL,
+               lease_epoch      = j.lease_epoch + 1,
+               last_error_class   = 'UnregisteredHandler',
+               last_error_message = CAST(:message AS text),
+               updated_at       = now()
+         WHERE j.id          = CAST(:jid AS uuid)
+           AND j.worker_id   = CAST(:wid AS uuid)
+           AND j.lease_epoch = CAST(:ep AS bigint)
+           AND j.status      = 'running'
+     RETURNING j.id, j.organization_id, j.project_id, j.queue_id, j.correlation_id,
+               j.payload, j.status, j.unregistered_count, j.run_at
+    ),
+    closed AS (
+        UPDATE job_executions e
+           SET status      = 'lost',
+               finished_at = now(),
+               duration_ms = CASE
+                                 WHEN e.started_at IS NOT NULL
+                                 THEN (EXTRACT(EPOCH FROM now() - e.started_at) * 1000)::int
+                             END,
+               error_class   = 'UnregisteredHandler',
+               error_message = CAST(:message AS text)
+          FROM released r
+         WHERE e.job_id      = r.id
+           AND e.lease_epoch = CAST(:ep AS bigint)
+           AND e.finished_at IS NULL
+     RETURNING e.id
+    ),
+    dlq AS (
+        INSERT INTO dead_letter_entries
+            (organization_id, project_id, queue_id, job_id, correlation_id,
+             error_class, error_message, error_fingerprint, payload_snapshot,
+             dead_lettered_at)
+        SELECT r.organization_id, r.project_id, r.queue_id, r.id, r.correlation_id,
+               'UnregisteredHandler', CAST(:message AS text),
+               md5('UnregisteredHandler'
+                   || coalesce(substring(CAST(:message AS text) FOR 200), '')),
+               r.payload, now()
+          FROM released r
+         WHERE r.status = 'dead_letter'
+     RETURNING id
+    )
+    SELECT r.id                 AS job_id,
+           r.status             AS status,
+           r.unregistered_count AS unregistered_count,
+           r.run_at             AS run_at,
+           (SELECT count(*) FROM closed) AS executions_closed,
+           (SELECT count(*) FROM dlq)    AS dlq_entries
+      FROM released r
+    """
 )
 
 # SIGTERM: hand back claims that never reached the handler. Free, because attempt
@@ -184,15 +299,38 @@ class WorkerRunner:
         self._cancel_requested: set[UUID] = set()
         self._cancel_watch: dict[UUID, asyncio.Task[None]] = {}
         self._drain_requested = False
-        # Smallest lease among the queues this worker serves; drives the beat.
+        # Two bounds on the beat, and the beat obeys the smaller of them.
+        # _lease_seconds is the queue-side bound: it covers the gap between claiming
+        # a job and the first heartbeat that sees it. _held_lease_seconds is the real
+        # one -- the shortest lease this worker is ACTUALLY holding, refreshed from
+        # heartbeat.sql's lease_expires_at on every beat, None when it holds nothing.
         self._lease_seconds = DEFAULT_LEASE_SECONDS
+        self._held_lease_seconds: float | None = None
         self._heartbeat_stop = asyncio.Event()
         self._heartbeat_task: asyncio.Task[None] | None = None
 
     @property
     def heartbeat_interval(self) -> float:
-        """``lease_seconds / 6``: five missed beats before a lease can expire."""
-        return max(MIN_HEARTBEAT_INTERVAL, self._lease_seconds / 6)
+        """``lease / 6``: five missed beats before a lease can expire.
+
+        INVARIANT: **the interval is never wider than one sixth of the shortest lease
+        this worker actually HOLDS.** It is not derived from the queues the worker
+        might claim from, because those two sets diverge -- and every way they
+        diverge is a reaping bug.
+
+        The one that bites: queue A has ``visibility_timeout_sec`` 10, queue B has
+        300, and the worker is running a job from A when an operator pauses A. A
+        beat sized from the *unpaused* queues sees only B, widens to 50s, and the
+        10s lease on the job in flight expires. The reaper then reclaims a job that
+        is ACTIVELY RUNNING and a second worker executes it. ``lease_epoch`` fencing
+        rejects the loser's COMMIT; it cannot un-send the emails the loser sent.
+        (``jobs.lease_seconds`` is snapshotted at enqueue, so editing a queue's
+        timeout splits the two sets the same way, without any pause involved.)
+        """
+        lease = float(self._lease_seconds)
+        if self._held_lease_seconds is not None:
+            lease = min(lease, self._held_lease_seconds)
+        return max(MIN_HEARTBEAT_INTERVAL, lease / 6)
 
     # --- lifecycle ---
     async def register(self) -> UUID:
@@ -285,12 +423,33 @@ class WorkerRunner:
         async with self.sessionmaker() as s:
             result = await heartbeat(s, self.worker_id)
             await s.commit()
+        self._note_held_leases(result.leases)
         if result.drain_requested and not self._drain_requested:
             self._drain_requested = True
             log.info("worker.drain_requested", worker=self.name, inflight=len(self._inflight))
             await self._mark_draining()
         for job_id in result.cancelled_job_ids:
             self._observe_cancel(job_id)
+
+    def _note_held_leases(self, leases: tuple[LeaseRenewal, ...]) -> None:
+        """Re-derive the beat from the leases the database just renewed for us.
+
+        Cleared when nothing is held: an idle worker has no lease to protect and
+        falls back to the queue-side bound rather than pinning the beat forever at
+        whatever the last job happened to need.
+
+        The worker's clock appears here and nowhere else in this module, and it sizes
+        an *interval* -- it never renews or expires anything, both of which stay
+        entirely with the database's ``now()``. It is read AFTER the round trip
+        rather than before so the elapsed time makes the estimate short, never long.
+        """
+        if not leases:
+            self._held_lease_seconds = None
+            return
+        now = datetime.now(UTC)
+        self._held_lease_seconds = min(
+            (lease.lease_expires_at - now).total_seconds() for lease in leases
+        )
 
     async def _mark_draining(self) -> None:
         assert self.worker_id is not None
@@ -344,8 +503,15 @@ class WorkerRunner:
                 )
             ).all()
         if rows:
-            # The shortest lease we could be holding sets the beat for all of them.
-            self._lease_seconds = min(int(r[2]) for r in rows)
+            shortest = min(int(r[2]) for r in rows)
+            # A newly claimed job can only come from an unpaused queue, so this bounds
+            # the leases we are about to take on. It may only SHRINK while we hold
+            # work: pausing a queue removes it from this list, and the lease on a job
+            # already running did not get longer because an operator paused the queue
+            # it came from. The beat that renews it must not slow down.
+            self._lease_seconds = (
+                min(self._lease_seconds, shortest) if self._inflight else shortest
+            )
         return _weighted_order([(r[0], int(r[1])) for r in rows])
 
     async def _claim_round(self) -> int:
@@ -488,30 +654,62 @@ class WorkerRunner:
 
     async def _release_unregistered(self, cj: ClaimedJob, handler_name: str) -> None:
         """This worker does not know the handler (mixed deployment / rolling upgrade).
-        Release WITHOUT consuming an attempt, but count it: without the counter this
-        is an infinite claim/release loop across the fleet at claim-poll rate."""
+
+        Release without routing through ``fail_job``: a handler this worker happens not
+        to have is not a failed attempt, so it consumes no retry budget and leaves no
+        failure on the timeline. But release to a delayed ``scheduled``, not to an
+        immediately-claimable ``queued``, and give up after
+        ``UNREGISTERED_MAX_RELEASES``. See ``_RELEASE_UNREGISTERED`` for why each
+        of those, and why the execution close is gated on this statement's own
+        ``RETURNING`` set instead of on "the open row for this job".
+
+        A ``None`` row means the fence rejected the write: the reaper already took the
+        job back and another worker may own it. That is precisely the case where the
+        old unfenced close corrupted the live attempt, so there is nothing to do here
+        but say so.
+        """
         assert self.worker_id is not None
+        message = f"no handler registered for {handler_name!r}"
         async with self.sessionmaker() as s:
-            await s.execute(
-                text(
-                    "UPDATE jobs SET status='queued', worker_id=NULL, claimed_at=NULL,"
-                    " lease_expires_at=NULL, lease_epoch=lease_epoch+1,"
-                    " unregistered_count=unregistered_count+1, updated_at=now()"
-                    " WHERE id=CAST(:jid AS uuid) AND worker_id=CAST(:wid AS uuid)"
-                    " AND lease_epoch=:ep AND status='running'"
-                ),
-                {"jid": str(cj.job_id), "wid": str(self.worker_id), "ep": cj.lease_epoch},
-            )
-            await s.execute(
-                text(
-                    "UPDATE job_executions SET status='lost', finished_at=now(),"
-                    " error_class='UnregisteredHandler'"
-                    " WHERE job_id=CAST(:jid AS uuid) AND finished_at IS NULL"
-                ),
-                {"jid": str(cj.job_id)},
-            )
+            row = (
+                await s.execute(
+                    _RELEASE_UNREGISTERED,
+                    {
+                        "jid": str(cj.job_id),
+                        "wid": str(self.worker_id),
+                        "ep": cj.lease_epoch,
+                        "message": message,
+                        "threshold": UNREGISTERED_MAX_RELEASES,
+                        "backoff_sec": UNREGISTERED_BACKOFF_SEC,
+                        "backoff_max_sec": UNREGISTERED_BACKOFF_MAX_SEC,
+                    },
+                )
+            ).first()
             await s.commit()
-        log.error("job.unregistered_handler", job_id=str(cj.job_id), handler=handler_name)
+
+        if row is None:
+            log.warning(
+                "job.unregistered_release_fenced_out",
+                job_id=str(cj.job_id),
+                handler=handler_name,
+            )
+        elif JobStatus(row.status) is JobStatus.DEAD_LETTER:
+            log.error(
+                "job.unregistered_dead_lettered",
+                job_id=str(cj.job_id),
+                handler=handler_name,
+                unregistered_count=row.unregistered_count,
+                dlq_entries=row.dlq_entries,
+            )
+        else:
+            log.error(
+                "job.unregistered_handler",
+                job_id=str(cj.job_id),
+                handler=handler_name,
+                unregistered_count=row.unregistered_count,
+                max_releases=UNREGISTERED_MAX_RELEASES,
+                next_run_at=row.run_at.isoformat(),
+            )
 
     async def _mark_cancelled(self, cj: ClaimedJob, reason: str) -> bool:
         """running -> cancelled, fenced. False means the lease was stolen first."""

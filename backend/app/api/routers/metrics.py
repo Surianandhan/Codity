@@ -6,13 +6,22 @@ Two rules keep these endpoints cheap enough to poll:
   statuses only. A ``GROUP BY status`` without that predicate degrades into a scan
   of all job history, which grows without bound while the answer -- how much work
   is outstanding right now -- does not.
-* **Throughput comes from ``queue_stats_minute``**, not from counting job rows. A
-  chart that recounts history on every 30s poll is a self-inflicted load test.
+* **Everything else is aggregated from ``jobs`` and ``job_executions``
+  directly.** There used to be a ``queue_stats_minute`` rollup here, but nothing in
+  the running system ever wrote to it -- only ``scripts/seed.py`` did -- so every
+  window counter was frozen at whatever the seed left behind and every live job was
+  invisible. Reinstating a rollup writer would mean a second source of truth that
+  can drift, a backfill, and its own tests; aggregating the source tables is correct
+  by construction, and at this system's volume the scans are bounded by retention.
 
 Empty buckets are gap-filled with ``generate_series`` in SQL. Returning only the
 minutes that happened to have rows makes the client reconstruct the time axis, and
 a flat-line outage renders as a *gap* rather than as zero -- which is the one
 reading the chart exists to make obvious.
+
+Each metric is bucketed by the timestamp that actually dates the event it counts;
+the choice is commented at each branch, because getting it wrong is invisible in
+the response and wrong in the chart.
 """
 
 from datetime import datetime
@@ -159,20 +168,105 @@ async def _depth(
     return counts
 
 
-_ROLLUP_SQL = """
-SELECT COALESCE(SUM(s.enqueued), 0)::bigint       AS enqueued,
-       COALESCE(SUM(s.completed), 0)::bigint      AS completed,
-       COALESCE(SUM(s.failed), 0)::bigint         AS failed,
-       COALESCE(SUM(s.dead_lettered), 0)::bigint  AS dead_lettered,
-       COALESCE(SUM(s.retried), 0)::bigint        AS retried,
-       COALESCE(SUM(s.sum_duration_ms), 0)::bigint AS sum_duration_ms,
-       COALESCE(MAX(s.max_duration_ms), 0)::int    AS max_duration_ms
-  FROM queue_stats_minute s
-  JOIN queues q ON q.id = s.queue_id
- WHERE q.organization_id = CAST(:org_id AS uuid)
-   AND (CAST(:project_id AS uuid) IS NULL OR q.project_id = CAST(:project_id AS uuid))
-   AND (CAST(:queue_id   AS uuid) IS NULL OR s.queue_id   = CAST(:queue_id   AS uuid))
-   AND s.bucket_start >= date_trunc('minute', now()) - make_interval(secs => :window_seconds)
+def _job_scope(project_id: UUID | None, queue_id: UUID | None) -> str:
+    """Tenant predicate on ``jobs``, built from constants only -- never from input.
+
+    Emitted as literal SQL rather than as ``(:project_id IS NULL OR ...)`` because a
+    parameterised OR is not sargable: the planner cannot know at plan time which
+    branch survives, so it declines the index and scans. Every value stays a bound
+    parameter; only the *presence* of a clause varies, and only across the three
+    call sites in this module.
+
+    ``organization_id`` is always required even when a queue or project already
+    pins the tenant. It is redundant given fk_jobs_queue and the caller's own
+    ownership check, and it stays anyway -- a redundant tenant predicate on a
+    reporting query costs a filter, and dropping one is how a cross-tenant read
+    gets introduced later by someone reading this as permission to relax it.
+    """
+    clauses = ["j.organization_id = CAST(:org_id AS uuid)"]
+    if project_id is not None:
+        clauses.append("j.project_id = CAST(:project_id AS uuid)")
+    if queue_id is not None:
+        clauses.append("j.queue_id = CAST(:queue_id AS uuid)")
+    return "\n       AND ".join(clauses)
+
+
+def _scope_params(
+    org_id: UUID, project_id: UUID | None, queue_id: UUID | None
+) -> dict[str, str]:
+    """Exactly the parameters `_job_scope` emitted -- no more, no fewer."""
+    params = {"org_id": str(org_id)}
+    if project_id is not None:
+        params["project_id"] = str(project_id)
+    if queue_id is not None:
+        params["queue_id"] = str(queue_id)
+    return params
+
+
+# Window totals. Three independent scans, one per timestamp column, because a job's
+# enqueue, its outcome and its attempts are three different events at three
+# different instants -- OR-ing them into one WHERE would both mis-date the counters
+# and defeat every index.
+_ROLLUP_TEMPLATE = """
+WITH win AS (
+    SELECT now() - make_interval(secs => :window_seconds) AS lo
+),
+enq AS (
+    -- Enqueues bucket by created_at: a job is enqueued when it enters the system,
+    -- and created_at is the only timestamp a job that has not yet run even has.
+    -- Project scope rides ix_jobs_project_created (project_id, created_at DESC) --
+    -- leading equality plus a range on the second column. Queue scope rides
+    -- ix_jobs_queue_status_created on queue_id, with created_at as a filter.
+    SELECT count(*)::bigint AS enqueued
+      FROM jobs j CROSS JOIN win w
+     WHERE {scope}
+       AND j.created_at >= w.lo
+),
+outcome AS (
+    -- Terminal outcomes bucket by finished_at, NOT created_at: a job completed when
+    -- it finished. A three-day-old job that succeeds now belongs to this window, and
+    -- dating it by creation would file today's throughput under a bucket that has
+    -- already scrolled off the chart.
+    -- ck_jobs_terminal_finished makes status-terminal and finished_at-non-NULL
+    -- equivalent in both directions, so the status filter alone is total here.
+    -- 'cancelled' is deliberately absent: an operator withdrawing work is not a
+    -- failure, and counting it would drag success_rate down for a non-event.
+    -- Rides ix_jobs_queue_status_created (queue_id, status) on the queue-scoped
+    -- path; on the project-scoped path only project_id is indexed and finished_at
+    -- is a filter -- there is no index on finished_at, and adding one is a
+    -- migration, which is out of scope for this change.
+    SELECT count(*) FILTER (WHERE j.status = 'completed')::bigint   AS completed,
+           count(*) FILTER (WHERE j.status = 'failed')::bigint      AS failed,
+           count(*) FILTER (WHERE j.status = 'dead_letter')::bigint AS dead_lettered
+      FROM jobs j CROSS JOIN win w
+     WHERE {scope}
+       AND j.status IN ('completed', 'failed', 'dead_letter')
+       AND j.finished_at >= w.lo
+),
+attempt AS (
+    -- Durations and retries come from job_executions, the only table that records
+    -- per-attempt timing, bucketed by the execution's own finished_at: an attempt
+    -- becomes measurable exactly when it closes.
+    -- attempt_number is (jobs.attempt + 1) at claim, so > 1 is by definition a
+    -- re-execution -- a retry -- and needs no join back to the retry decision.
+    -- AVG/MAX ignore NULL duration_ms rather than treating it as zero. Executions
+    -- that were claimed but never started (reaped as 'lost') and every row written
+    -- before start_job began setting job_executions.started_at have NULL here; a
+    -- COALESCE to 0 would report those as instantaneous work, which is a lie.
+    -- The join is jobs -> job_executions on job_id, ix_job_executions_job's
+    -- leading column.
+    SELECT count(*) FILTER (WHERE e.attempt_number > 1)::bigint AS retried,
+           avg(e.duration_ms)::float8                          AS mean_duration_ms,
+           max(e.duration_ms)                                  AS max_duration_ms
+      FROM job_executions e
+      JOIN jobs j ON j.id = e.job_id
+     CROSS JOIN win w
+     WHERE {scope}
+       AND e.finished_at >= w.lo
+)
+SELECT e.enqueued, o.completed, o.failed, o.dead_lettered,
+       a.retried, a.mean_duration_ms, a.max_duration_ms
+  FROM enq e CROSS JOIN outcome o CROSS JOIN attempt a
 """
 
 
@@ -184,17 +278,11 @@ async def _rollup(
     project_id: UUID | None = None,
     queue_id: UUID | None = None,
 ) -> dict[str, Any]:
-    row = (
-        await session.execute(
-            text(_ROLLUP_SQL),
-            {
-                "org_id": str(org_id),
-                "project_id": str(project_id) if project_id else None,
-                "queue_id": str(queue_id) if queue_id else None,
-                "window_seconds": window_seconds,
-            },
-        )
-    ).one()
+    sql = _ROLLUP_TEMPLATE.format(scope=_job_scope(project_id, queue_id))
+    params: dict[str, Any] = dict(_scope_params(org_id, project_id, queue_id))
+    params["window_seconds"] = window_seconds
+    row = (await session.execute(text(sql), params)).one()
+
     completed = int(row.completed)
     failed = int(row.failed)
     dead = int(row.dead_lettered)
@@ -205,10 +293,92 @@ async def _rollup(
         "failed": failed,
         "dead_lettered": dead,
         "retried": int(row.retried),
-        "mean_duration_ms": (int(row.sum_duration_ms) / completed) if completed else None,
-        "max_duration_ms": int(row.max_duration_ms),
+        # None, not 0.0: an empty window has no mean, and 0ms is a claim about
+        # speed that no row supports.
+        "mean_duration_ms": (
+            float(row.mean_duration_ms) if row.mean_duration_ms is not None else None
+        ),
+        # max_duration_ms is typed `int` on all three response models (and on the
+        # frontend), so NULL has to land somewhere -- 0 is the only value the
+        # contract admits. mean_duration_ms is `float | None` and carries the
+        # "nothing measurable in this window" signal honestly; read the two together.
+        "max_duration_ms": int(row.max_duration_ms) if row.max_duration_ms is not None else 0,
+        # None, not 0.0: "no jobs finished" and "every job failed" are opposite
+        # facts and must not render as the same number.
         "success_rate": (completed / finished) if finished else None,
     }
+
+
+# Same three event streams as the rollup, UNION ALL'd into one per-minute stream and
+# then gap-filled. date_trunc('minute', ...) is the finest bucket the API offers, and
+# every coarser bucket (5m/15m/1h) is a whole number of minutes, so a truncated event
+# always falls inside exactly one bucket.
+_THROUGHPUT_TEMPLATE = """
+WITH bounds AS (
+    SELECT h.hi,
+           h.hi - make_interval(secs => :window_seconds - :bucket_seconds) AS lo
+      FROM (
+          SELECT to_timestamp(
+                     floor(extract(epoch FROM now()) / :bucket_seconds)::bigint
+                     * :bucket_seconds
+                 ) AS hi
+      ) h
+),
+buckets AS (
+    SELECT gs AS bucket_start
+      FROM bounds b,
+           generate_series(b.lo, b.hi, make_interval(secs => :bucket_seconds)) AS gs
+),
+events AS (
+    -- Enqueues: dated by created_at. See _ROLLUP_TEMPLATE for why each branch
+    -- picks the timestamp it does; the two queries must agree or the chart and the
+    -- stat cards will disagree on the same window.
+    SELECT date_trunc('minute', j.created_at) AS bucket_start,
+           1 AS enqueued, 0 AS completed, 0 AS failed, 0 AS dead_lettered,
+           0 AS retried, NULL::int AS duration_ms
+      FROM jobs j
+     WHERE {scope}
+       AND j.created_at >= (SELECT lo FROM bounds)
+    UNION ALL
+    -- Terminal outcomes: dated by finished_at.
+    SELECT date_trunc('minute', j.finished_at),
+           0,
+           CASE WHEN j.status = 'completed'   THEN 1 ELSE 0 END,
+           CASE WHEN j.status = 'failed'      THEN 1 ELSE 0 END,
+           CASE WHEN j.status = 'dead_letter' THEN 1 ELSE 0 END,
+           0,
+           NULL::int
+      FROM jobs j
+     WHERE {scope}
+       AND j.status IN ('completed', 'failed', 'dead_letter')
+       AND j.finished_at >= (SELECT lo FROM bounds)
+    UNION ALL
+    -- Attempts: dated by the execution's finished_at.
+    SELECT date_trunc('minute', e.finished_at),
+           0, 0, 0, 0,
+           CASE WHEN e.attempt_number > 1 THEN 1 ELSE 0 END,
+           e.duration_ms
+      FROM job_executions e
+      JOIN jobs j ON j.id = e.job_id
+     WHERE {scope}
+       AND e.finished_at >= (SELECT lo FROM bounds)
+)
+SELECT b.bucket_start,
+       COALESCE(SUM(ev.enqueued), 0)::bigint      AS enqueued,
+       COALESCE(SUM(ev.completed), 0)::bigint     AS completed,
+       COALESCE(SUM(ev.failed), 0)::bigint        AS failed,
+       COALESCE(SUM(ev.dead_lettered), 0)::bigint AS dead_lettered,
+       COALESCE(SUM(ev.retried), 0)::bigint       AS retried,
+       -- No COALESCE: an empty bucket has no mean, and the response model says so.
+       AVG(ev.duration_ms)::float8                AS mean_duration_ms,
+       COALESCE(MAX(ev.duration_ms), 0)::int      AS max_duration_ms
+  FROM buckets b
+  LEFT JOIN events ev
+         ON ev.bucket_start >= b.bucket_start
+        AND ev.bucket_start <  b.bucket_start + make_interval(secs => :bucket_seconds)
+ GROUP BY b.bucket_start
+ ORDER BY b.bucket_start
+"""
 
 
 @router.get("/projects/{project_id}/metrics/summary", response_model=MetricsSummaryOut)
@@ -260,46 +430,6 @@ async def metrics_summary(
     }
 
 
-_THROUGHPUT_SQL = """
-WITH bounds AS (
-    SELECT to_timestamp(
-               floor(extract(epoch FROM now()) / :bucket_seconds)::bigint * :bucket_seconds
-           ) AS hi
-),
-buckets AS (
-    SELECT gs AS bucket_start
-      FROM bounds b,
-           generate_series(
-               b.hi - make_interval(secs => :window_seconds - :bucket_seconds),
-               b.hi,
-               make_interval(secs => :bucket_seconds)
-           ) AS gs
-),
-scoped AS (
-    SELECT s.*
-      FROM queue_stats_minute s
-      JOIN queues q ON q.id = s.queue_id
-     WHERE q.organization_id = CAST(:org_id AS uuid)
-       AND q.project_id = CAST(:project_id AS uuid)
-       AND (CAST(:queue_id AS uuid) IS NULL OR s.queue_id = CAST(:queue_id AS uuid))
-)
-SELECT b.bucket_start,
-       COALESCE(SUM(s.enqueued), 0)::bigint        AS enqueued,
-       COALESCE(SUM(s.completed), 0)::bigint       AS completed,
-       COALESCE(SUM(s.failed), 0)::bigint          AS failed,
-       COALESCE(SUM(s.dead_lettered), 0)::bigint   AS dead_lettered,
-       COALESCE(SUM(s.retried), 0)::bigint         AS retried,
-       COALESCE(SUM(s.sum_duration_ms), 0)::bigint AS sum_duration_ms,
-       COALESCE(MAX(s.max_duration_ms), 0)::int    AS max_duration_ms
-  FROM buckets b
-  LEFT JOIN scoped s
-         ON s.bucket_start >= b.bucket_start
-        AND s.bucket_start <  b.bucket_start + make_interval(secs => :bucket_seconds)
- GROUP BY b.bucket_start
- ORDER BY b.bucket_start
-"""
-
-
 @router.get("/projects/{project_id}/metrics/throughput", response_model=ThroughputOut)
 async def metrics_throughput(
     project_id: UUID,
@@ -315,18 +445,11 @@ async def metrics_throughput(
     await _assert_project(session, project_id, org_id)
     window_seconds, bucket_seconds = _resolve_window(window, bucket)
 
-    rows = (
-        await session.execute(
-            text(_THROUGHPUT_SQL),
-            {
-                "org_id": str(org_id),
-                "project_id": str(project_id),
-                "queue_id": str(queue_id) if queue_id else None,
-                "window_seconds": window_seconds,
-                "bucket_seconds": bucket_seconds,
-            },
-        )
-    ).all()
+    sql = _THROUGHPUT_TEMPLATE.format(scope=_job_scope(project_id, queue_id))
+    params: dict[str, Any] = dict(_scope_params(org_id, project_id, queue_id))
+    params["window_seconds"] = window_seconds
+    params["bucket_seconds"] = bucket_seconds
+    rows = (await session.execute(text(sql), params)).all()
 
     data = [
         {
@@ -337,7 +460,7 @@ async def metrics_throughput(
             "dead_lettered": int(r.dead_lettered),
             "retried": int(r.retried),
             "mean_duration_ms": (
-                int(r.sum_duration_ms) / int(r.completed) if int(r.completed) else None
+                float(r.mean_duration_ms) if r.mean_duration_ms is not None else None
             ),
             "max_duration_ms": int(r.max_duration_ms),
         }
@@ -378,6 +501,9 @@ async def queue_stats(
     ).scalar_one()
 
     rollup = await _rollup(session, org_id, _WINDOW_SECONDS[window], queue_id=queue_id)
+    # QueueStatsOut has no success_rate field; the rollup computes it for the
+    # summary endpoint, so drop it rather than let response_model silently eat it.
+    rollup.pop("success_rate", None)
     return {
         "queue_id": queue.id,
         "name": queue.name,

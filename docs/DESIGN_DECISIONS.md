@@ -21,7 +21,7 @@ Vocabulary: [`SCHEMA_NAMES.md`](SCHEMA_NAMES.md). Structure: [`DATABASE.md`](DAT
 | [010](#adr-010--keyset-pagination) | Pagination | Keyset |
 | [011](#adr-011--primary-key-types) | Primary keys | UUIDv7 + `bigint` children |
 | [012](#adr-012--the-scheduler-is-its-own-process) | Scheduler | Separate process, N-safe by constraint |
-| [013](#adr-013--tenant-isolation-without-rls) | Tenant isolation | App-level + composite FKs |
+| [013](#adr-013--tenant-isolation-without-rls) | Tenant isolation | Hand-filtered + composite FKs |
 | [014](#adr-014--two-roles-not-four) | RBAC | Two roles |
 | [015](#adr-015--polling-not-websockets) | Live updates | Polling |
 | [016](#adr-016--inline-mermaid-diagrams) | Diagrams | Inline Mermaid |
@@ -250,8 +250,11 @@ every claim scan rows it cannot have.
 - One promotion path for delayed jobs, cron occurrences, and retries — the same code, tested once.
 - A dead promoter stalls all three. That is why `system_state.last_run_at` is on the dashboard
   (ARCHITECTURE §5); it is the system's most dangerous silent failure.
-- Evidence: `test_retry_goes_to_scheduled_not_queued`, and an acceptance check that a job failing
-  with `base=2s` exponential is not re-claimed for at least 1.9s.
+- Evidence: `test_retry_goes_to_scheduled_not_queued` — a failed attempt with budget left lands in
+  `scheduled` with `finished_at` NULL and the fence advanced; a claim then returns nothing (the
+  predicate is `status='queued'`, full stop), and with `run_at` pushed an hour out the promoter
+  returns nothing either. Both halves are asserted, which is what makes it a test of the
+  *destination* rather than of the wording of a status.
 
 **Revisit if.** Promotion latency becomes the dominant term in end-to-end retry time. `LISTEN/NOTIFY`
 would replace the promoter's poll.
@@ -271,8 +274,10 @@ what a graceful shutdown has to do.
 
 **Why.** A job released from `claimed` **provably never executed** — the handler is invoked only
 after the guarded start returns a row. So there is nothing to decrement, graceful release costs
-nothing, and `attempt` can be **strictly monotonic**, which the transition trigger enforces
-(`NEW.attempt < OLD.attempt` is rejected). Option 1 needs a compensating write on a shutdown path —
+nothing, and `attempt` is **only ever incremented**, by exactly one statement, on exactly one edge.
+Nothing in the schema enforces that monotonicity — there is no transition trigger and no CHECK on
+`attempt`'s direction; it holds because no other statement writes the column. Option 1 needs a
+compensating write on a shutdown path —
 the one path least likely to run to completion, since it executes precisely when the process is
 being killed.
 
@@ -290,7 +295,7 @@ being killed.
   every deploy: the release commits while the start is in flight, another worker claims the
   now-`queued` job immediately, and the original handler runs to completion anyway. No lease expiry,
   no partition, no slow worker involved — just a rolling restart.
-- Evidence: `test_sigterm_releases_unstarted_claims`, `test_start_rowcount_zero_cancels_task`.
+- Evidence: `test_sigterm_releases_unstarted_claims`, `test_start_rowcount_zero_means_do_not_run`.
 
 **Revisit if.** Never; the alternative is strictly worse.
 
@@ -337,18 +342,22 @@ Decorrelated jitter with a floor would be the replacement.
 
 **Decision.** Option 2.
 
-**Why.** Option 1 gives terminal states out-edges, which means the transition trigger has to permit
-`dead_letter → queued` and `completed → queued` — and once those edges exist, nothing distinguishes
-a deliberate replay from a bug that resurrects a completed job. It also destroys history: the
+**Why.** Option 1 gives terminal states out-edges — `dead_letter → queued` and `completed → queued`
+would have to become legal — and once those edges exist, nothing distinguishes a deliberate replay
+from a bug that resurrects a completed job. That matters more here than it would elsewhere, because
+the state machine is enforced only by each statement's `WHERE` clause naming its source status
+([`DATABASE.md`](DATABASE.md) §5): there is no trigger holding the diagram, so an edge that becomes
+writable is an edge anything can take. It also destroys history: the
 attempt history, the error, the timings and the DLQ record are all overwritten by the replay, so the
 one artefact an operator needs to understand *why* it failed is gone.
 
 **Consequences.**
-- Terminal states have **zero out-edges**; the trigger stays small enough to read in one sitting.
+- Terminal states have **zero out-edges**, so the diagram in [`DATABASE.md`](DATABASE.md) §5 stays
+  small enough to read in one sitting.
 - The UI timeline can show the original and the replay as separate, linked runs.
 - `ux_jobs_live_idempotency` is scoped to *live* statuses, so replaying a dead-lettered job that
-  carried an `Idempotency-Key` does not collide with its own ancestor. Evidence:
-  `test_dlq_replay_of_keyed_job_succeeds`.
+  carried an `Idempotency-Key` does not collide with its own ancestor. **This is not covered by a
+  test** — see [`TESTING.md`](TESTING.md) §3. The index is right; the assertion is missing.
 - Job count grows with replays. That is what a history table is for.
 
 **Revisit if.** Never.
@@ -377,7 +386,9 @@ the cursor forward, so a concurrent insert cannot displace a page.
 - The cursor tuple must match index order exactly, which is why `ix_jobs_project_created` and
   `ix_jobs_queue_status_created` are `(… created_at DESC, id DESC)`.
 - No page-number UI. Infinite scroll / "load more" instead.
-- Evidence: a cursor walked to exhaustion under concurrent inserts returns each job exactly once.
+- **No test covers this.** A cursor walked to exhaustion under concurrent inserts returning each
+  job exactly once is the property that matters, and it is unasserted — see
+  [`TESTING.md`](TESTING.md) §3.
 
 **Revisit if.** A user-facing requirement genuinely needs jump-to-page.
 
@@ -464,23 +475,45 @@ the system is still correct — which is the test of whether a lock is load-bear
 could ship.
 
 **Options.**
-1. Filter by `organization_id` in each query by hand.
-2. A `TenantSession` that injects the predicate automatically, plus composite FKs that make
-   cross-tenant rows unrepresentable.
+1. Filter by `organization_id` in each query by hand, over composite FKs that make cross-tenant rows
+   unrepresentable.
+2. Option 1 **plus** a `TenantSession` that injects the predicate automatically via SQLAlchemy's
+   `with_loader_criteria`.
 3. Option 2 **plus** Postgres Row-Level Security.
 
-**Decision.** Option 2. RLS is deliberately **not** implemented.
+**Decision — and what actually shipped is option 1, not option 2.** This ADR originally recorded
+option 2 as the decision. It is worth correcting in place rather than quietly, because the gap
+between the two is the difference between a control and a convention.
 
-**Why not option 1.** It relies on nobody ever forgetting, on a codebase that will grow. That is a
-policy, not a control.
+**What is real.** The structural half, and it is the stronger half:
 
-**Why not option 3 — a real trade-off, not an oversight.** RLS is a *second* enforcement layer for
-something already enforced structurally (composite FKs) and behaviourally (the loader hook), and
-already asserted by a CI test that every tenant-scoped model emits an `organization_id` predicate. It
-costs roughly a day, and every fixture, migration or admin script that forgets to `SET` the GUC turns
-into an opaque "my test returns zero rows and no error" debugging session. Spending that day on the
-reliability core — worth 15 marks and the thing that actually distinguishes this submission — was the
-better trade.
+- `jobs` declares `UNIQUE (id, organization_id)` (`uq_jobs_id_organization_id`).
+- `job_executions` references **`(job_id, organization_id)`** rather than `job_id` alone
+  (`fk_job_executions_job`).
+
+A child row whose tenant disagrees with its parent's is therefore **not representable**. The
+database rejects it regardless of what the application does, and this holds for the raw-SQL hot path
+exactly as it holds for the ORM. A forged cross-tenant row is impossible, not merely unlikely.
+
+**What is not real: the loader hook.** `TenantSession` and `with_loader_criteria` are **zero hits in
+the codebase**. Every tenant-scoped read filters by hand — each router writes
+`.where(… .organization_id == principal.organization_id)` explicitly — which is precisely the option
+this ADR once dismissed as "a policy, not a control". That dismissal was correct, and the honest
+position is that the query half of this design is a convention that relies on nobody forgetting, on
+a codebase that will grow.
+
+**Why it matters, stated exactly.** The composite FKs stop a cross-tenant row being *written*. They
+do nothing to stop a router that omits its predicate from *reading* across tenants, and nothing
+would catch it: there is no loader hook, no RLS, and no test asserting that every tenant-scoped
+query emits an `organization_id` predicate. For a system whose worst possible bug is a cross-tenant
+read, that is the weakest link in the design, and it is one file of SQLAlchemy event wiring away
+from being closed. The loader hook is the next thing to build here, ahead of RLS.
+
+**Why not option 3 — a real trade-off, not an oversight.** RLS is a *second* enforcement layer, and
+adding it before the *first* behavioural layer exists gets the order wrong. It also costs roughly a
+day, and every fixture, migration or admin script that forgets to `SET` the GUC turns into an opaque
+"my test returns zero rows and no error" debugging session. Spending that day on the reliability
+core was the better trade; spending the next hour on the loader hook is a better trade still.
 
 **The documented hardening step**, so this is a decision with a migration path rather than a gap:
 
@@ -501,9 +534,12 @@ than raising when the GUC is unset, so an unset connection sees zero rows instea
 which is exactly the opaque failure described above, and why the rollout needs a session-level
 assertion that the GUC is set.
 
-**Consequences.** Enforcement lives in one hook plus the FK graph, both tested. A raw-SQL statement
-that bypasses the ORM must carry its own `organization_id` predicate — the hot-path `.sql` files do,
-and they are reviewed as SQL for exactly this reason.
+**Consequences.** Enforcement is asymmetric, and the asymmetry should be understood rather than
+averaged: **structurally strong** (the FK graph, which no code path can bypass) and
+**behaviourally weak** (hand-written predicates, unenforced and untested). A raw-SQL statement that
+bypasses the ORM must carry its own `organization_id` predicate — the hot-path `.sql` files do, and
+they are reviewed as SQL for exactly this reason. The same is spelled out from the schema's side in
+[`DATABASE.md`](DATABASE.md) §8.
 
 **Revisit if.** A compliance requirement demands defence in depth at the database layer, or raw-SQL
 surface grows beyond the reviewed hot path.
@@ -529,10 +565,13 @@ billing, member removal, org delete. It slots into the same dependency as a `req
 comparison against an ordered enum — no schema change beyond widening the `role` CHECK.
 
 **Consequences.**
-- A constraint trigger prevents removing or demoting the **last owner**, so an org cannot be locked
-  out through a normal UI action.
 - **Cross-tenant access returns 404, not 403.** A 403 confirms the resource exists, which is an
-  enumeration oracle across tenants. Evidence: `test_cross_org_returns_404`.
+  enumeration oracle across tenants. This is how the routers behave; **no test asserts it**
+  ([`TESTING.md`](TESTING.md) §3).
+- There is **no last-owner guard** — no constraint trigger, no application check. Nothing can
+  currently demote or remove the last owner because the membership mutation endpoints are not built
+  ([`API.md`](API.md) §1), so the hole is closed by absence rather than by a control. The guard
+  lands with the endpoint that needs it, and it has to land in the same change.
 
 **Revisit if.** Real multi-user orgs need finer separation of duty.
 

@@ -4,9 +4,9 @@ PostgreSQL 15 is the whole backend: system of record, queue substrate, lock mana
 Column and value names come from [`SCHEMA_NAMES.md`](SCHEMA_NAMES.md); the rationale behind each
 structural choice is in [`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md).
 
-Nineteen tables — eighteen entity tables plus the `queue_stats_minute` rollup. Tables land in
-migration order across build slices; `uv run alembic current` and `\dt` in `psql` show what is live
-in your database right now.
+Seventeen tables — sixteen entity tables plus `queue_stats_minute`, which is now vestigial (see
+below). Tables land in migration order across build slices; `uv run alembic current` and `\dt` in
+`psql` show what is live in your database right now.
 
 ---
 
@@ -54,12 +54,10 @@ erDiagram
     JOB_EXECUTIONS ||--o{ JOB_LOGS : emits
     WORKERS ||--o{ JOB_EXECUTIONS : runs
     WORKERS ||--o{ WORKER_HEARTBEATS : reports
-    WORKERS ||--o{ WORKER_QUEUE_ASSIGNMENTS : subscribes
-    QUEUES ||--o{ WORKER_QUEUE_ASSIGNMENTS : served_by
 ```
 
-`idempotency_keys` and `system_state` are omitted from the diagram: neither has an entity
-relationship worth drawing. They are described in §3.
+`system_state` is omitted from the diagram: it has no entity relationship worth drawing. It is
+described in §3.
 
 ---
 
@@ -71,8 +69,8 @@ relationship worth drawing. They are described in §3.
 |---|---|
 | `organizations` | The tenant boundary. Every tenant-scoped table carries `organization_id`, and the composite FKs above make it non-forgeable. |
 | `users` | Global identity. Argon2id password hash, plus `token_version` for global revocation on password change. |
-| `organization_members` | Join table carrying `role` (`owner` \| `member`). PK `(organization_id, user_id)`. A constraint trigger prevents removing or demoting the last owner — otherwise an org becomes permanently unadministrable through a normal UI action. |
-| `refresh_tokens` | Rotating refresh tokens keyed by `jti`, with `replaced_by_jti` so **reuse of a rotated token is detectable** and can revoke the whole chain. Without the back-pointer, a stolen refresh token is indistinguishable from a legitimate one. |
+| `organization_members` | Join table carrying `role` (`owner` \| `member`). PK `(organization_id, user_id)`. There is **no** last-owner guard: membership mutation endpoints are not built (see [`API.md`](API.md) §1), so nothing can currently demote the last owner, and the guard lands with the endpoint that needs it. |
+| `refresh_tokens` | Refresh tokens keyed by `jti`, issued and persisted at register/login. `replaced_by_jti` is **declared but never written**: rotation and reuse detection need a `/auth/refresh` endpoint, and that endpoint is not built (see [`API.md`](API.md) §2). The column is the schema half of a feature whose behaviour half is deferred. |
 | `projects` | Namespace inside an org. Queue names are unique per project, not globally — which is why the worker's `--queues` takes `project-slug/queue-name`. |
 
 ### Configuration
@@ -85,7 +83,7 @@ relationship worth drawing. They are described in §3.
 Two CHECKs on `queues` earn their place:
 
 ```sql
-CONSTRAINT ck_queues_pause CHECK (is_paused = (paused_at IS NOT NULL))
+CONSTRAINT ck_queues_pause_consistency CHECK (is_paused = (paused_at IS NOT NULL))
 CONSTRAINT ck_queues_timeout_lt_lease CHECK (default_timeout_ms < visibility_timeout_sec * 1000)
 ```
 
@@ -108,16 +106,30 @@ never be *configured* into guaranteed double execution.
 | Table | Why |
 |---|---|
 | `workers` | Fleet registry keyed `(organization_id, name)`. Denormalised `last_heartbeat_at` serves the hot liveness check; `drain_requested` rides back to the worker on the heartbeat's `RETURNING`. |
-| `worker_heartbeats` | Append-only history. The column answers "is it alive"; the table gives the dashboard a real timeline and gives the reaper tests something to assert against. |
-| `worker_queue_assignments` | Which worker subscribes to which queue. Lets the dashboard answer "this queue has no workers", which is otherwise indistinguishable from "this queue is idle" — and that distinction is the single most common false "the system is broken" report. |
+| `worker_heartbeats` | Append-only history. The column answers "is it alive"; the table gives the dashboard a real timeline and gives the reaper tests something to assert against. Exposed at `GET /workers/{worker_id}/heartbeats`. |
+
+Queue **subscription** is a worker process argument (`--queues`), not a table. There is no
+`worker_queue_assignments` table and no persisted worker→queue mapping, so the dashboard cannot yet
+distinguish "this queue has no workers" from "this queue is idle". That table is the fix, and it is
+not built — see the deferred list in [`../README.md`](../README.md).
 
 ### Infrastructure
 
 | Table | Why |
 |---|---|
-| `idempotency_keys` | `(organization_id, key)` with the request hash and stored response, committed **in the same transaction as the job insert**. Two transactions cannot make this atomic. |
-| `system_state` | One row per scheduler loop (`promoter`, `cron`, `reaper`, `retention`) with `last_run_at` and `last_error`. Cross-process staleness needs a durable home; see `ARCHITECTURE.md` §5. |
-| `queue_stats_minute` | Per-minute rollup for the throughput chart, so the dashboard never aggregates the hot `jobs` table. |
+| `system_state` | One row per scheduler loop (`promoter`, `reaper`, `cron`, `dead_worker`, `retention`) with `last_run_at` and `last_error`. Cross-process staleness needs a durable home; see `ARCHITECTURE.md` §5. |
+| `queue_stats_minute` | **Vestigial — nothing reads it.** Designed as a per-minute rollup for the throughput chart, but the metrics endpoints now aggregate `jobs` and `job_executions` directly, so no read path remains. Only `scripts/seed.py` writes rows; the retention loop deletes them. A candidate for removal, kept for now because dropping a table is a migration this submission does not need. See `ARCHITECTURE.md` §5. |
+
+**There is no `idempotency_keys` table.** The **job row itself is the idempotency record**, and that
+is a real design property rather than a shortcut: because the record *is* the row, it is committed in
+the same transaction as the job by construction, and there is no window in which a key is reserved
+but the job is not. Uniqueness comes from `ux_jobs_live_idempotency` (index 8 in §6). The request
+fingerprint is **recomputed** from the persisted job on each replay rather than stored, and **no
+response body is stored** — a replay is re-serialised from the job row. The one fidelity cost of
+recomputation is stated in `app/services/idempotency.py`'s module docstring: a `delayed` job persists
+`run_at`, not `delay_ms`, so timing is excluded from the fingerprint for that kind. Adding
+`idempotency_keys` and hashing the raw body into it is what buys that fidelity back; see
+[`API.md`](API.md) §4.
 
 ---
 
@@ -134,7 +146,7 @@ still executing**. Guaranteed double execution, on a path with no error and no a
 un-insertable.
 
 ```sql
-CONSTRAINT ck_jobs_occurrence CHECK ((schedule_id IS NULL) = (scheduled_for IS NULL))
+CONSTRAINT ck_jobs_schedule_occurrence CHECK ((schedule_id IS NULL) = (scheduled_for IS NULL))
 ```
 `scheduled_for` is meaningless without a schedule, and a schedule occurrence without its instant
 cannot be deduplicated by `ux_jobs_schedule_occurrence`.
@@ -155,6 +167,22 @@ CONSTRAINT ck_jobs_terminal_finished CHECK (
 Terminal means finished. Note the biconditional: it also rejects a `finished_at` on a live job. Any
 statement that writes a terminal status **must** write `finished_at` in the same `UPDATE` or the
 whole transaction aborts — which is why `fail_job.sql` sets it explicitly on the dead-letter branch.
+
+This is the one invariant in the schema that is **structurally unbreakable rather than merely
+observed**, and it is worth naming as such. There are exactly five write paths in the codebase that
+can move a job into a terminal status, and all five satisfy the biconditional in the same statement:
+
+| Write path | Terminal status it writes |
+|---|---|
+| `db/sql/complete_job.sql` | `completed` |
+| `db/sql/fail_job.sql`, retry-exhausted branch | `dead_letter` |
+| `db/sql/fail_job.sql`, non-retryable branch | `failed` |
+| `db/sql/reap_leases.sql`, `attempt >= max_attempts` | `dead_letter` |
+| `api/routers/jobs.py`, the cancel route | `cancelled` |
+
+A sixth path added later cannot get this wrong quietly: it either writes `finished_at` or its
+transaction aborts. "Terminal jobs always have a finish time" therefore needs no test to stay true,
+which is why no test asserts it.
 
 `lease_seconds` is snapshotted from `queues.visibility_timeout_sec` at enqueue. The queue is the
 single source of truth for lease length; the worker never carries its own.
@@ -185,14 +213,27 @@ stateDiagram-v2
 ```
 
 **Terminal states have zero out-edges.** Manual retry and DLQ replay do not resurrect a job — they
-insert a *new* job with `replay_of_job_id` pointing back at the original. History stays immutable,
-the timeline stays truthful, and the trigger below stays simple enough to read.
+insert a *new* job with `replay_of_job_id` pointing back at the original. History stays immutable and
+the timeline stays truthful.
 
-Enforcement is in the database, not only in Python. A `BEFORE UPDATE` trigger
-`enforce_job_status_transition` rejects any edge not in this diagram with SQLSTATE `23514`, and
-rejects `NEW.attempt < OLD.attempt`. `app/domain/enums.py` holds the same edge set as
-`LEGAL_TRANSITIONS`, and a test asserts the two agree — one diagram, two enforcement points, no
-drift.
+**Where this is enforced, honestly.** There is **one** enforcement point, not two. The schema
+contains **no triggers at all** (`grep "CREATE TRIGGER" backend/alembic/versions/` returns nothing).
+What actually holds the state machine:
+
+- Every transition is written by a **guarded `UPDATE` whose `WHERE` clause names the source status**
+  — `claim_jobs.sql` matches `status = 'queued'`, `start_job.sql` matches `status = 'claimed'`,
+  `complete_job.sql` and `fail_job.sql` match `status = 'running'`. An illegal edge does not raise;
+  it updates zero rows, and every caller checks the rowcount. That is the mechanism the concurrency
+  tests actually exercise.
+- The CHECK constraints in §4 close the invariants a status guard cannot see —
+  `ck_jobs_terminal_finished` above being the strongest of them.
+
+`LEGAL_TRANSITIONS` in `app/domain/enums.py` is the diagram above transcribed as data. It is
+currently **referenced by nothing** — no runtime check and no test imports it. It is documentation
+in executable form, and until something asserts against it, drift between it and the SQL is
+possible. A `BEFORE UPDATE` trigger rejecting off-diagram edges with SQLSTATE `23514`, plus a test
+asserting the trigger's edge set equals `LEGAL_TRANSITIONS`, is the design that would make this two
+enforcement points with no drift; it is not built.
 
 Two edges deserve a note:
 
@@ -299,27 +340,53 @@ and partitioning would add migration complexity with no observable benefit.
 
 ## 8. Multi-tenancy enforcement
 
-Enforcement is **application-level**: a `TenantSession` installs a SQLAlchemy `with_loader_criteria`
-hook that injects `organization_id = :current_org` into every query against a tenant-scoped model,
-backed by the composite foreign keys in §1. A CI test asserts that every tenant-scoped model emits
-an `organization_id` predicate.
+Enforcement has two halves, and only one of them is structural.
 
-Postgres RLS is **deliberately not implemented** — see [ADR-013](DESIGN_DECISIONS.md). The exact
-policy DDL is recorded there as the documented production hardening step, so this is a stated
-judgement call with a written migration path, not an omission.
+**The structural half — real, and the stronger of the two.** Composite foreign keys carry the tenant:
+`jobs` declares `UNIQUE (id, organization_id)` and `job_executions` references
+`(job_id, organization_id)` rather than `job_id` alone. A child row whose tenant disagrees with its
+parent's is therefore **not representable** — the database rejects it, no matter what the application
+does. This holds for the raw-SQL hot path exactly as it holds for the ORM.
+
+**The query half — a convention, not a control.** Every tenant-scoped read filters by hand: each
+router writes `.where(... .organization_id == principal.organization_id)` explicitly. There is no
+`TenantSession` and no SQLAlchemy `with_loader_criteria` hook; neither exists in the codebase. Nor is
+there a test asserting that every tenant-scoped query emits an `organization_id` predicate. The
+composite FKs mean a *forged* cross-tenant row is impossible, but a router that forgets its predicate
+would still *read* across tenants, and nothing would catch it. See [ADR-013](DESIGN_DECISIONS.md),
+which states this plainly and records the loader hook as the intended next step.
+
+Postgres RLS is **deliberately not implemented** — also ADR-013. The exact policy DDL is recorded
+there as the documented production hardening step, so this is a stated judgement call with a written
+migration path, not an omission.
 
 ---
 
 ## 9. Migration order
 
-The chain must topologically sort, and CI runs `alembic upgrade head` then `downgrade base` against
-an empty database to prove it:
+The chain must topologically sort. `tests/test_migrations.py::test_upgrade_downgrade_roundtrip` runs
+`alembic upgrade head` then `downgrade base` against the test database to prove it. (This is a local
+`make test` assertion, not a CI job — there is no CI in this repository; see the deferred list in
+[`../README.md`](../README.md).)
 
-`0001` organizations, users, organization_members → `0002` refresh_tokens (+ `users.token_version`)
-→ `0003` projects → `0004` retry_policies, queues → `0005` job_batches, job_schedules → `0006` jobs
-+ transition trigger → `0007` workers, worker_queue_assignments, worker_heartbeats → `0008`
-job_executions, job_logs → `0009` dead_letter_entries → `0010` idempotency_keys, system_state →
-`0011` hot-path indexes → `0012` queue_stats_minute.
+Revisions are Alembic's default hash ids rather than a hand-numbered sequence. Five of them, in
+`down_revision` order:
 
-Where a cycle is genuinely unavoidable — `jobs.worker_id` ↔ `workers.id` — the table is created
-first and the FK added later with `op.create_foreign_key`.
+| # | Revision | Creates |
+|---:|---|---|
+| 1 | `10765f663942` — *core schema* | `organizations`, `users`, `organization_members`, `projects`, `refresh_tokens`, `retry_policies`, `queues`, `jobs` |
+| 2 | `eafcffd66e0b` — *workers and executions* | `workers`, `worker_heartbeats`, `job_executions` |
+| 3 | `f8ef4aba8de3` — *log_line_count server default* | no tables; fixes a default |
+| 4 | `484e1c2dbe89` — *fix frozen refresh_tokens created_at default* | no tables; replaces a DDL literal with `text('now()')` |
+| 5 | `eb052146b351` — *scheduling, dlq, logs, observability* | `system_state`, `job_batches`, `job_schedules`, `queue_stats_minute`, `dead_letter_entries`, `job_logs` |
+
+Eight plus three plus six is the seventeen tables in §3.
+
+Where a cycle is genuinely unavoidable — `jobs` references `job_schedules` and `job_batches`, both of
+which are created after it — the column ships with the table and the FK is added later with
+`op.create_foreign_key` (`fk_jobs_schedule_id`, `fk_jobs_batch_id` in revision 5).
+
+`jobs.worker_id` carries **no** foreign key to `workers.id` — the column is declared plain in both
+the model and the migration. The referential guarantee lives on `job_executions.worker_id`, which
+does declare the FK (`ON DELETE SET NULL`), so attempt history stays consistent while a swept worker
+row leaves `jobs.worker_id` pointing at nothing.

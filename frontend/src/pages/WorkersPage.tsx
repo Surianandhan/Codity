@@ -5,22 +5,16 @@ import { EmptyState } from '../components/EmptyState'
 import { StatCard } from '../components/StatCard'
 import { StatusBadge } from '../components/StatusBadge'
 import { useSystemStatus, useWorkers } from '../hooks/queries'
-import { formatInstant, relativeTo, shortId } from '../lib/format'
+import { formatDuration, formatInstant, shortId } from '../lib/format'
+import { schedulerTickAgeSeconds } from '../types'
 import type { WorkerRow } from '../types'
-
-/** A worker whose heartbeat is older than this is presumed lost by the reaper. */
-const STALE_HEARTBEAT_MS = 60_000
-
-function heartbeatAgeMs(worker: WorkerRow): number | null {
-  if (!worker.last_heartbeat_at) return null
-  const then = new Date(worker.last_heartbeat_at).getTime()
-  return Number.isNaN(then) ? null : Date.now() - then
-}
 
 export function WorkersPage() {
   const { orgId = '' } = useParams()
   const workers = useWorkers(orgId)
   const status = useSystemStatus()
+
+  const tickAge = schedulerTickAgeSeconds(status.data)
 
   const columns: Column<WorkerRow>[] = [
     {
@@ -35,29 +29,30 @@ export function WorkersPage() {
     },
     { key: 'status', header: 'Status', render: (worker) => <StatusBadge status={worker.status} /> },
     {
+      // Both the age and the verdict come from the server, which measures every
+      // worker against one clock — now() in Postgres — using the same 150s grace
+      // the reaper does. Re-deriving either from the browser's clock made the
+      // fleet's health depend on the operator's laptop being in NTP agreement
+      // with the database, and disagreed with the backend besides.
       key: 'liveness',
       header: 'Heartbeat',
-      render: (worker) => {
-        const age = heartbeatAgeMs(worker)
-        const stale = age === null || age > STALE_HEARTBEAT_MS
-        return (
-          <span
-            title={formatInstant(worker.last_heartbeat_at)}
-            className={stale ? 'text-rose-300' : 'text-emerald-300'}
-          >
-            {relativeTo(worker.last_heartbeat_at)}
-          </span>
-        )
-      },
+      render: (worker) => (
+        <span
+          title={formatInstant(worker.last_heartbeat_at)}
+          className={worker.is_live ? 'text-emerald-300' : 'text-rose-300'}
+        >
+          {worker.heartbeat_age_seconds == null
+            ? 'never'
+            : `${formatDuration(worker.heartbeat_age_seconds * 1000)} ago`}
+        </span>
+      ),
     },
     {
       key: 'load',
       header: 'Load',
       className: 'tabular-nums',
       render: (worker) =>
-        worker.active_jobs === null || worker.active_jobs === undefined
-          ? '—'
-          : `${worker.active_jobs}${worker.concurrency ? ` / ${worker.concurrency}` : ''}`,
+        `${worker.inflight}${worker.concurrency ? ` / ${worker.concurrency}` : ''}`,
     },
     {
       key: 'drain',
@@ -79,14 +74,15 @@ export function WorkersPage() {
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard
           label="Live workers"
-          value={status.data?.workers_live ?? workers.data?.length ?? 0}
+          value={status.data?.fleet.live ?? workers.data?.length ?? 0}
           tone="good"
           loading={status.isLoading}
         />
         <StatCard
           label="Registered"
-          value={status.data?.workers_total ?? workers.data?.length ?? 0}
+          value={status.data?.fleet.total ?? workers.data?.length ?? 0}
           loading={status.isLoading}
+          hint={status.data ? `${status.data.fleet.draining} draining` : undefined}
         />
         <StatCard
           label="DLQ depth"
@@ -96,15 +92,11 @@ export function WorkersPage() {
         />
         <StatCard
           label="Scheduler tick"
-          value={
-            status.data?.scheduler_last_tick_age_seconds === null ||
-            status.data?.scheduler_last_tick_age_seconds === undefined
-              ? '—'
-              : `${Math.round(status.data.scheduler_last_tick_age_seconds)}s`
-          }
-          tone={
-            (status.data?.scheduler_last_tick_age_seconds ?? 0) > 30 ? 'bad' : 'default'
-          }
+          // `== null` on purpose: the field is absent, not null, whenever the
+          // status query has not resolved, and `=== null` let undefined through
+          // to Math.round — which is where the literal "NaN" came from.
+          value={tickAge == null ? '—' : `${Math.round(tickAge)}s`}
+          tone={tickAge != null && tickAge > 30 ? 'bad' : 'default'}
           hint="a stale tick stalls every delayed job and every backoff retry"
           loading={status.isLoading}
         />

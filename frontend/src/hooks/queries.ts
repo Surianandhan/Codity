@@ -15,7 +15,6 @@ import {
   cancelJob,
   fetchJob,
   fetchMetricsSummary,
-  fetchQueue,
   fetchQueueStats,
   fetchSystemStatus,
   fetchThroughput,
@@ -64,16 +63,11 @@ export function useQueues(projectId: string | undefined) {
   })
 }
 
-export function useQueue(queueId: string | undefined) {
-  return useQuery({
-    queryKey: ['queue', queueId],
-    queryFn: () => fetchQueue(queueId as string),
-    enabled: Boolean(queueId),
-    refetchInterval: POLL.queues,
-    ...shared,
-  })
-}
-
+/**
+ * The queue screen's single source. `/queues/{id}/stats` carries the queue's
+ * identity as well as its depth, and there is no `GET /queues/{id}` to pair it
+ * with — the second request this used to make was a 404 that blanked the page.
+ */
 export function useQueueStats(queueId: string | undefined) {
   return useQuery({
     queryKey: ['queue-stats', queueId],
@@ -217,7 +211,9 @@ export function useQueuePauseToggle(projectId: string | undefined) {
     },
     onSettled: (_data, _error, variables) => {
       void client.invalidateQueries({ queryKey: ['queues', projectId] })
-      void client.invalidateQueries({ queryKey: ['queue', variables.queueId] })
+      // The queue screen reads is_paused from /stats, so that is the key to
+      // refresh — ['queue', id] no longer exists.
+      void client.invalidateQueries({ queryKey: ['queue-stats', variables.queueId] })
     },
   })
 }

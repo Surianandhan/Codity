@@ -21,30 +21,38 @@ the shapes, the guarantees, and the reasoning. Field and value names are pinned 
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/auth/register` | Create user + organization, returns tokens |
-| POST | `/auth/login` | Access + refresh token |
-| POST | `/auth/refresh` | Rotate refresh token (with reuse detection) |
-| POST | `/auth/logout` | Revoke refresh token |
+| POST | `/auth/login` | Access + refresh token, both in the JSON body |
 | GET | `/auth/me` | Current principal |
+
+Those three are the whole auth surface. **There is no `/auth/refresh` and no `/auth/logout`** — see
+§2 and the deferred list in [`../README.md`](../README.md).
 
 ### Organizations and projects
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET / PATCH | `/orgs/{org_id}` | Organization |
-| GET / POST | `/orgs/{org_id}/members` | Membership |
-| GET / POST | `/orgs/{org_id}/projects` | Projects |
-| GET / PATCH / DELETE | `/projects/{project_id}` | Project |
-| GET / POST | `/orgs/{org_id}/retry-policies` | Reusable retry policies |
+| GET / POST | `/orgs/{org_id}/projects` | List and create projects |
+
+That is the entire org/project surface. There is no route on `/orgs/{org_id}` itself, no membership
+endpoint, no retry-policy endpoint, and no `GET`/`PATCH`/`DELETE` on a single project. The
+`organizations`, `organization_members` and `retry_policies` tables exist and are populated by
+`scripts/seed.py`; the CRUD over them is deferred, not hidden — see [`../README.md`](../README.md).
 
 ### Queues
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET / POST | `/projects/{project_id}/queues` | Queues in a project |
-| GET / PATCH / DELETE | `/queues/{queue_id}` | Queue configuration |
+| GET / POST | `/projects/{project_id}/queues` | List and create queues in a project |
 | POST | `/queues/{queue_id}/pause` | Sets `is_paused=true, paused_at=now()` |
 | POST | `/queues/{queue_id}/resume` | Sets `is_paused=false, paused_at=NULL` |
-| GET | `/queues/{queue_id}/stats` | Depth by live status + rollup counters |
+| GET | `/queues/{queue_id}/stats` | Configuration, depth by live status, window counters |
+
+**There is no `GET /queues/{queue_id}`.** `/stats` is the single-queue read: it returns the queue's
+configuration alongside its depth, and the dashboard's queue screen is built on it. The consequence
+is visible in the UI — a queue's project is not recoverable from the queue id alone, so the
+dashboard hands `project_id` over in router state on the way in and omits the back-link on a cold
+deep link rather than faking it. There is no `PATCH` or `DELETE` on a queue either; pause and resume
+are the only mutations.
 
 Pause blocks **admission only**. In-flight jobs finish, and the cron dispatcher does not materialise
 occurrences into a paused queue (it increments `skipped_occurrences` instead) — otherwise a paused
@@ -77,7 +85,8 @@ says "paused — 4 still running".
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/orgs/{org_id}/workers` | Worker fleet + liveness |
-| GET | `/workers/{worker_id}` | Worker detail + heartbeat history |
+| GET | `/workers/{worker_id}` | Worker detail |
+| GET | `/workers/{worker_id}/heartbeats` | Heartbeat history, keyset paged |
 | POST | `/workers/{worker_id}/drain` | Sets `drain_requested` |
 | GET | `/projects/{project_id}/dlq` | Dead letter entries |
 | POST | `/dlq/{entry_id}/replay` | Replay + resolve the entry |
@@ -91,12 +100,14 @@ says "paused — 4 still running".
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/healthz` | Process alive. No I/O. |
-| GET | `/readyz` | Database reachable, migrations current. |
+| GET | `/readyz` | Database reachable — it opens a connection and runs `select 1`. It does **not** check that migrations are current; a schema-version probe is not implemented. |
 
 The DLQ has no dedicated *screen* in the dashboard — it is a saved filter on the job explorer
-(`?status=dead_letter`) with per-row and bulk replay. It does have its own endpoints, because the
-operator workflow (resolution, who replayed, error fingerprint grouping) is real data that does not
-live on `jobs`.
+(`?status=dead_letter`). Replay from the UI is **one job at a time, from the job detail screen**:
+the explorer lists dead-lettered jobs but carries no replay button and no multi-select, so bulk
+replay is an API-only operation today. The DLQ does have its own endpoints, because the operator
+workflow (resolution, who replayed, error fingerprint grouping) is real data that does not live on
+`jobs`.
 
 ---
 
@@ -107,16 +118,30 @@ JWT bearer, `Authorization: Bearer <access_token>`.
 | Token | TTL | Storage |
 |---|---|---|
 | Access | 15 minutes | Client memory; sent as a bearer header |
-| Refresh | 30 days | **httpOnly cookie**, rotated on every use |
+| Refresh | 30 days | Returned in the login/register JSON body; the client stores it |
 
-- Passwords are hashed with **Argon2id**.
-- Refresh tokens rotate: each use issues a new `jti` and records `replaced_by_jti` on the old row.
-  Presenting an already-rotated token is **reuse detection** — the whole chain is revoked, because a
-  rotated token in a second pair of hands means it was stolen.
-- `users.token_version` gives global revocation on password change: every previously issued access
-  token stops validating without a per-token blocklist.
-- The refresh token is a cookie rather than memory because an in-memory-only session logs the user
-  out on page reload — which is the very first thing anyone does.
+- Passwords are hashed with **Argon2id**, and rehashed on successful login when the parameters have
+  since been strengthened.
+- `users.token_version` is claimed as `ver` in the access token and **re-checked against the
+  database on every request**, alongside org membership — so a bumped version invalidates every
+  previously issued access token without a per-token blocklist. The check is live; there is not yet
+  a password-change endpoint that bumps it.
+
+**Refresh-token rotation is not implemented.** This is the one place where the schema is ahead of
+the code, and it is worth stating exactly rather than leaving it to be discovered:
+
+- `refresh_tokens` is created on login with a `jti`, and the column `replaced_by_jti` exists on the
+  table for rotation to write into. **Nothing ever writes it**, because there is no endpoint that
+  rotates.
+- There is therefore **no reuse detection** and no chain revocation.
+- There is **no httpOnly cookie anywhere in the codebase** — `set_cookie` is never called. The
+  refresh token travels in the JSON body like the access token.
+- With no `/auth/refresh`, an expired access token means logging in again; with no `/auth/logout`,
+  a refresh token is only invalidated by its own expiry.
+
+The intended design — rotate on every use, record `replaced_by_jti`, treat presentation of an
+already-rotated token as theft and revoke the whole chain — is recorded in the deferred list in
+[`../README.md`](../README.md). It is a design, not shipped behaviour.
 
 **Authorization.** Two roles, `owner` and `member` ([ADR-014](DESIGN_DECISIONS.md)). Mutating routes
 require membership via a single `require_member` dependency; reads require authentication plus org
@@ -192,10 +217,35 @@ override), with a 1 MiB CHECK on `jobs.payload` as the database backstop.
 
 ## 4. Idempotency
 
-`Idempotency-Key` is accepted on `POST /queues/{queue_id}/jobs`. The key, a hash of the request body,
-and the response are stored in `idempotency_keys` and committed **in the same transaction as the job
-insert** — two transactions cannot make this atomic, and a crash between them is exactly the case the
-header exists to survive.
+`Idempotency-Key` is accepted on `POST /queues/{queue_id}/jobs`.
+
+**There is no `idempotency_keys` table. The job row *is* the idempotency record.** That is the whole
+mechanism, and it is worth stating precisely because the usual design stores a key, a body hash and
+a serialised response in a table of its own:
+
+- **Uniqueness** is the partial index `ux_jobs_live_idempotency` — `UNIQUE (queue_id,
+  idempotency_key) WHERE idempotency_key IS NOT NULL AND status IN (live statuses)`.
+- **Atomicity is free**, and this is the part the separate table exists to buy. The key and the job
+  commit together because they are the *same row*. There is no window in which a key is reserved but
+  the job is not, so there is no crash to survive between two writes.
+- **The request fingerprint is recomputed, not stored.** A replay is compared against a fingerprint
+  derived from the persisted job — effective `kind`, `handler`, `payload`, `priority`,
+  `max_attempts`, `timeout_ms`, `backoff_strategy` — rather than against a hash written at insert
+  time. Effective values are used so that omitting a field that defaults to the same value does not
+  read as a different body.
+- **No response is stored.** A replay re-serialises the original job row, which is what the original
+  `201` contained anyway.
+- A transaction-scoped `pg_try_advisory_xact_lock` on `(queue_id, key)` serialises duplicate
+  requests across every API replica, which is what turns the in-flight case into an immediate `409`
+  instead of a request blocked on the unique index until the first transaction commits.
+
+**The one cost of recomputation, stated rather than hidden:** a `delayed` job stores
+`run_at = created_at + delay_ms` rather than `delay_ms` itself, and `created_at` is a server clock
+while `run_at` is an application clock — so the delay is not exactly reconstructible. Timing is
+therefore excluded from the fingerprint for `delayed`, and included verbatim for `scheduled`, which
+stores the client's instant as given. Restoring full fidelity means adding the `idempotency_keys`
+table and hashing the raw request body into it. The module's own docstring in
+`app/services/idempotency.py` says the same thing.
 
 | Situation | Result |
 |---|---|
@@ -278,7 +328,6 @@ errors while domain errors use the envelope, and the API has two shapes.
 | `QueuePaused` | `queue_paused` | 409 |
 | `IdempotencyKeyReuse` | `idempotency_key_reuse` | 422 |
 | `IdempotencyInProgress` | `idempotency_in_progress` | 409 |
-| `RateLimited` | `rate_limited` | 429 |
 | unknown query parameter | `unknown_query_param` | 400 |
 | unhandled | `internal_error` | 500 |
 

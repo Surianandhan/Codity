@@ -1,6 +1,12 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { clearTokens, getAccessToken, setTokens } from '../api/client'
+import {
+  FORBIDDEN_EVENT,
+  UNAUTHORIZED_EVENT,
+  clearTokens,
+  getAccessToken,
+  setTokens,
+} from '../api/client'
 import { fetchMe, login as loginRequest, register as registerRequest } from '../api/endpoints'
 import type { Me } from '../types'
 
@@ -45,8 +51,44 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const onUnauthorized = () => setMe(null)
-    window.addEventListener('codity:unauthorized', onUnauthorized)
-    return () => window.removeEventListener('codity:unauthorized', onUnauthorized)
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
+  }, [])
+
+  /**
+   * Access tokens expire (15 min) and there is no refresh endpoint, so a session
+   * that outlives its token would otherwise sit on a dashboard of red boxes
+   * until the operator thought to reload — every poll failing, nothing saying
+   * why.
+   *
+   * A 403 alone is not proof of that: the same status is the correct answer to a
+   * legitimate authorization failure, and treating it as logout would eject an
+   * operator for clicking one button they lack the role for. So a 403 only
+   * triggers the one question that distinguishes the two — GET /auth/me. If it
+   * answers, the token is fine and the 403 was about the resource; if it fails,
+   * the session is genuinely over and Protected redirects to /login.
+   *
+   * The in-flight guard matters because a dashboard is many concurrent polls:
+   * an expiry fires a 403 from every one of them at once, and this must ask
+   * once, not once per query.
+   */
+  useEffect(() => {
+    let revalidating = false
+    const onForbidden = () => {
+      if (revalidating || !getAccessToken()) return
+      revalidating = true
+      fetchMe()
+        .then((principal) => setMe(principal))
+        .catch(() => {
+          clearTokens()
+          setMe(null)
+        })
+        .finally(() => {
+          revalidating = false
+        })
+    }
+    window.addEventListener(FORBIDDEN_EVENT, onForbidden)
+    return () => window.removeEventListener(FORBIDDEN_EVENT, onForbidden)
   }, [])
 
   const signIn = useCallback(async (email: string, password: string) => {

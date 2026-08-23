@@ -1,13 +1,20 @@
 /**
- * Typed wrappers over the REST surface in docs/API.md. One function per
- * endpoint the dashboard uses; no component builds a URL by hand.
+ * Typed wrappers over the REST surface the routers actually implement. One
+ * function per endpoint the dashboard uses; no component builds a URL by hand.
+ *
+ * Every path and every literal here is checked against
+ * backend/app/api/routers/*.py, not against docs/API.md — a path the docs
+ * describe but no router serves is a 404 at runtime and a clean build at
+ * compile time.
  */
 import type {
   Job,
   JobExecution,
   JobLog,
   Me,
+  MetricsBucket,
   MetricsSummary,
+  MetricsWindow,
   Paged,
   Project,
   Queue,
@@ -39,10 +46,13 @@ export const listProjects = async (orgId: string) =>
 export const listQueues = async (projectId: string) =>
   unwrapList<Queue>(await request<Queue[] | Paged<Queue>>(`/projects/${projectId}/queues`))
 
-export const fetchQueue = (queueId: string) => request<Queue>(`/queues/${queueId}`)
-
-export const fetchQueueStats = (queueId: string) =>
-  request<QueueStats>(`/queues/${queueId}/stats`)
+/**
+ * There is no `GET /queues/{id}`. This endpoint carries the queue's identity
+ * (queue_id, name, is_paused, max_concurrency) alongside its depth, so the queue
+ * screen is one request rather than two — and the second one was a 404.
+ */
+export const fetchQueueStats = (queueId: string, window: MetricsWindow = '1h') =>
+  request<QueueStats>(`/queues/${queueId}/stats${query({ window })}`)
 
 export const pauseQueue = (queueId: string) =>
   request<Queue>(`/queues/${queueId}/pause`, { method: 'POST' })
@@ -85,13 +95,22 @@ export const replayJob = (jobId: string) => request<Job>(`/jobs/${jobId}/replay`
 export const listWorkers = async (orgId: string) =>
   unwrapList<WorkerRow>(await request<WorkerRow[] | Paged<WorkerRow>>(`/orgs/${orgId}/workers`))
 
-export const fetchMetricsSummary = (projectId: string) =>
-  request<MetricsSummary>(`/projects/${projectId}/metrics/summary`)
+export const fetchMetricsSummary = (projectId: string, window: MetricsWindow = '1h') =>
+  request<MetricsSummary>(`/projects/${projectId}/metrics/summary${query({ window })}`)
 
-export const fetchThroughput = async (projectId: string, windowMinutes = 60) =>
+/**
+ * `window` is a closed enum on the server (15m | 1h | 6h | 24h | 7d). "60m" is
+ * arithmetically an hour and is still a 422, which is why the type is the enum
+ * and not a number of minutes.
+ */
+export const fetchThroughput = async (
+  projectId: string,
+  window: MetricsWindow = '1h',
+  bucket: MetricsBucket = '1m',
+) =>
   unwrapList<ThroughputPoint>(
     await request<ThroughputPoint[] | Paged<ThroughputPoint>>(
-      `/projects/${projectId}/metrics/throughput${query({ window: `${windowMinutes}m`, bucket: '1m' })}`,
+      `/projects/${projectId}/metrics/throughput${query({ window, bucket })}`,
     ),
   )
 

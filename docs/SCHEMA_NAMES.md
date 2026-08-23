@@ -56,7 +56,7 @@ difference is load-bearing: a job can complete after several attempts that did n
 | Column | Table | Meaning |
 |---|---|---|
 | `run_at` | `jobs` | **The single eligibility timestamp.** The promoter moves `scheduled → queued` when `run_at <= now()`. Backoff writes a future `run_at`. |
-| `scheduled_for` | `jobs` | **Cron occurrence instant only.** The nominal time the recurrence rule fired. `NULL` unless `schedule_id` is set (`ck_jobs_occurrence` enforces the biconditional). Never used for eligibility. |
+| `scheduled_for` | `jobs` | **Cron occurrence instant only.** The nominal time the recurrence rule fired. `NULL` unless `schedule_id` is set (`ck_jobs_schedule_occurrence` enforces the biconditional). Never used for eligibility. |
 | `next_occurrence_at` | `job_schedules` | The next instant the dispatcher should materialise. Advanced from the nominal `scheduled_for`, never from `now()`. |
 | `claimed_at` / `started_at` / `finished_at` | `jobs`, `job_executions` | Lifecycle instants. |
 | `lease_expires_at` | `jobs` | When the reaper may reclaim. |
@@ -71,7 +71,7 @@ lease, so clock skew between nodes cannot cause a false reclaim.
 ## 4. Queue pause — `is_paused` **and** `paused_at`, always together
 
 ```sql
-CONSTRAINT ck_queues_pause CHECK (is_paused = (paused_at IS NOT NULL))
+CONSTRAINT ck_queues_pause_consistency CHECK (is_paused = (paused_at IS NOT NULL))
 ```
 
 Pause: `is_paused = true, paused_at = now()`. Resume: `is_paused = false, paused_at = NULL`.
@@ -104,15 +104,19 @@ reclaim, retry, graceful release. Every write a worker makes carries the epoch i
 zero rows updated means the lease was stolen and the result is discarded.
 
 - `lease_epoch` is **the fence**. Nothing else is.
-- `lock_version` is trigger-owned, bumped on every update including heartbeats. It can serve ORM
-  optimistic locking; it can **never** be the fence.
+- `lock_version` exists on `jobs` as a **reserved column for future ORM optimistic locking**. It is
+  set to `0` at insert and **never incremented** — no trigger owns it (the schema has no triggers)
+  and no statement bumps it. It is inert today, and it could **never** be the fence regardless.
 - `lease_expires_at > now()` is **not** a fence — it has an ABA hole (see `docs/DESIGN_DECISIONS.md`,
   ADR-004).
 
 ## 7. `attempt` — monotonic, incremented at `claimed → running`
 
 `jobs.attempt` starts at `0` and is incremented by exactly one in the guarded `start_job` statement.
-It is **never** decremented; a `BEFORE UPDATE` trigger rejects `NEW.attempt < OLD.attempt`.
+It is **never** decremented — `start_job.sql` is the only statement that writes the column, and it
+only ever adds one. Monotonicity is a property of having a single writer, not of a database
+constraint: there is no trigger rejecting `NEW.attempt < OLD.attempt`, because there are no triggers
+in this schema at all.
 
 A job released from `claimed` provably never executed, so nothing needs decrementing. This is what
 makes graceful shutdown free.
@@ -150,10 +154,12 @@ and 8 bytes beats 16:
 | Table | Key |
 |---|---|
 | `organization_members` | `(organization_id, user_id)` |
-| `worker_queue_assignments` | `(worker_id, queue_id)` |
 | `refresh_tokens` | `jti` (uuid) |
-| `idempotency_keys` | `(organization_id, key)` |
 | `system_state` | `name` (text: `promoter`, `cron`, `reaper`, `retention`) |
+
+There is no `worker_queue_assignments` table and no `idempotency_keys` table. Queue subscription is a
+worker CLI argument, and the job row is itself the idempotency record — see
+[`DATABASE.md`](DATABASE.md) §3.
 
 ## 11. Wire vocabulary
 

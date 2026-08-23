@@ -1,6 +1,6 @@
 import { useMemo } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { EmptyState, ErrorState } from '../components/EmptyState'
+import { EmptyState, ErrorState, MutationError } from '../components/EmptyState'
 import { StatusBadge } from '../components/StatusBadge'
 import { Timeline } from '../components/Timeline'
 import { useJob, useJobActions, useJobExecutions, useJobLogs } from '../hooks/queries'
@@ -46,6 +46,8 @@ export function JobPage() {
             {data.handler} · {data.kind} ·{' '}
             <Link
               to={`/queues/${data.queue_id}`}
+              // The queue screen has no way back to the project on its own.
+              state={{ projectId: data.project_id }}
               className="underline underline-offset-2 hover:text-ink-200"
             >
               queue {shortId(data.queue_id)}
@@ -67,8 +69,15 @@ export function JobPage() {
           <button
             type="button"
             className="btn-primary"
-            disabled={replay.isPending}
-            title="Replay inserts a new job with replay_of_job_id set; the terminal job is never resurrected."
+            // Replay is for terminal jobs only — the server answers 409 for
+            // anything still live. Offering a button whose only outcome is a
+            // rejection is worse than not offering it.
+            disabled={replay.isPending || !terminal}
+            title={
+              terminal
+                ? 'Replay inserts a new job with replay_of_job_id set; the terminal job is never resurrected.'
+                : `Replay is for terminal jobs only; this one is ${data.status}.`
+            }
             onClick={() =>
               replay.mutate(data.id, {
                 onSuccess: (created) => navigate(`/jobs/${created.id}`),
@@ -79,6 +88,14 @@ export function JobPage() {
           </button>
         </div>
       </div>
+
+      <MutationError
+        error={replay.error ?? cancel.error}
+        onDismiss={() => {
+          replay.reset()
+          cancel.reset()
+        }}
+      />
 
       <div className="grid grid-cols-2 gap-4 rounded-lg border border-ink-800 bg-ink-900/40 p-4 md:grid-cols-4">
         <Field label="Attempts" value={`${data.attempt} / ${data.max_attempts}`} />

@@ -11,6 +11,11 @@ const REFRESH_KEY = 'codity.refresh_token'
 
 export const BASE_URL = '/api/v1'
 
+/** The server closed the session outright. */
+export const UNAUTHORIZED_EVENT = 'codity:unauthorized'
+/** The server refused a request; it may or may not be the session. */
+export const FORBIDDEN_EVENT = 'codity:forbidden'
+
 export function getAccessToken(): string | null {
   try {
     return window.localStorage.getItem(TOKEN_KEY)
@@ -106,7 +111,17 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     const envelope = (parsed ?? {}) as ErrorEnvelope
     if (response.status === 401 && !options.anonymous) {
       clearTokens()
-      window.dispatchEvent(new CustomEvent('codity:unauthorized'))
+      window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT))
+    }
+    // The API raises PermissionDenied -> 403 for a missing, malformed, expired
+    // or revoked bearer token; it never issues 401, and there is no
+    // /auth/refresh to fall back on. But 403 is *also* the honest answer for a
+    // legitimate authorization failure (owner-only route, wrong org), so this
+    // deliberately does not clear the session. It only announces "the server
+    // refused"; useAuth decides by re-checking /auth/me, and only that failing
+    // ends the session.
+    if (response.status === 403 && !options.anonymous) {
+      window.dispatchEvent(new CustomEvent(FORBIDDEN_EVENT))
     }
     throw new ApiError(
       response.status,

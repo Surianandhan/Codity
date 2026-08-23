@@ -10,11 +10,12 @@ import {
 } from 'recharts'
 import { DataTable } from '../components/DataTable'
 import type { Column } from '../components/DataTable'
-import { EmptyState } from '../components/EmptyState'
+import { EmptyState, MutationError } from '../components/EmptyState'
 import { JobExplorer } from '../components/JobExplorer'
 import { StatCard } from '../components/StatCard'
 import { useMetricsSummary, useQueuePauseToggle, useQueues, useThroughput } from '../hooks/queries'
 import { formatClock } from '../lib/format'
+import { inflightOf } from '../types'
 import type { Queue } from '../types'
 
 export function ProjectPage() {
@@ -24,6 +25,11 @@ export function ProjectPage() {
   const summary = useMetricsSummary(projectId)
   const throughput = useThroughput(projectId)
   const toggle = useQueuePauseToggle(projectId)
+
+  // The queue screen cannot recover its project from the queue id — there is no
+  // GET /queues/{id} — so hand it over on the way in.
+  const openQueue = (queue: Queue) =>
+    navigate(`/queues/${queue.id}`, { state: { projectId } })
 
   const columns: Column<Queue>[] = [
     {
@@ -83,7 +89,7 @@ export function ProjectPage() {
             className="btn-secondary"
             onClick={(event) => {
               event.stopPropagation()
-              navigate(`/queues/${queue.id}`)
+              openQueue(queue)
             }}
           >
             Open
@@ -95,8 +101,12 @@ export function ProjectPage() {
 
   const chartData = (throughput.data ?? []).map((point) => ({
     ...point,
-    label: formatClock(point.bucket),
+    label: formatClock(point.bucket_start),
   }))
+
+  // Depth is a nested map of LIVE statuses only, keyed exactly as the partial
+  // index that produces it; the windowed counts sit flat alongside it.
+  const depth = summary.data?.depth
 
   return (
     <div className="space-y-6">
@@ -106,26 +116,28 @@ export function ProjectPage() {
           value={summary.data?.completed ?? 0}
           tone="good"
           loading={summary.isLoading}
+          hint="last hour"
         />
         <StatCard
           label="Running"
-          value={summary.data?.running ?? 0}
+          value={inflightOf(depth)}
           loading={summary.isLoading}
           hint="claimed + running"
         />
-        <StatCard label="Queued" value={summary.data?.queued ?? 0} loading={summary.isLoading} />
+        <StatCard label="Queued" value={depth?.queued ?? 0} loading={summary.isLoading} />
         <StatCard
           label="Failed"
           value={summary.data?.failed ?? 0}
           tone="warn"
           loading={summary.isLoading}
+          hint="last hour"
         />
         <StatCard
           label="Dead letter"
-          value={summary.data?.dead_letter ?? 0}
+          value={summary.data?.dlq_open ?? 0}
           tone="bad"
           loading={summary.isLoading}
-          hint="attempt budget exhausted"
+          hint="unresolved DLQ entries"
         />
       </div>
 
@@ -164,7 +176,7 @@ export function ProjectPage() {
                 <Area type="monotone" dataKey="failed" stackId="1" stroke="#fb7185" fill="#fb718555" />
                 <Area
                   type="monotone"
-                  dataKey="dead_letter"
+                  dataKey="dead_lettered"
                   stackId="1"
                   stroke="#f87171"
                   fill="#f8717155"
@@ -177,11 +189,12 @@ export function ProjectPage() {
 
       <section className="space-y-3">
         <h2 className="text-sm font-medium text-ink-100">Queues</h2>
+        <MutationError error={toggle.error} onDismiss={() => toggle.reset()} />
         <DataTable
           columns={columns}
           rows={queues.data}
           rowKey={(queue) => queue.id}
-          onRowClick={(queue) => navigate(`/queues/${queue.id}`)}
+          onRowClick={openQueue}
           loading={queues.isLoading}
           error={queues.error}
           onRetry={() => void queues.refetch()}
