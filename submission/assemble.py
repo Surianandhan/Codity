@@ -92,26 +92,103 @@ surfaced two defects that no single-session test had caught:
 Both are documented in the git history with the exact interleaving that
 triggers each one.
 
+### A hardening pass driven by three adversarial audits
+
+After the build was complete, three independent read-only audits were run
+against the finished repository — documentation against the grading rubric,
+backend against its own correctness claims, and the frontend against the
+*implemented* routers rather than the API documentation. They converged on one
+diagnosis: a **verification gap, not a capability gap**. Three artifacts had
+been written against intent and never checked against reality.
+
+**Three silent product bugs**, each invisible until something specific was
+measured:
+
+1. **`job_executions.started_at` was never written.** `start_job` updated only
+   `jobs`, so the execution row opened at claim time kept `started_at` NULL
+   permanently. Every `duration_ms` in the product was therefore NULL — both
+   `complete_job` and `fail_job` derive it from `e.started_at` — and
+   `ExecutionStatus.RUNNING` was unreachable, so an attempt could never be
+   observed in progress. The existing end-to-end test *selected* `duration_ms`
+   and never asserted on it, which is exactly why it survived.
+2. **The metrics rollup table had no writer.** `queue_stats_minute` was
+   created, read, and deleted — never inserted into. Throughput, success rate,
+   mean duration and eight fields across two endpoints were consequently zero
+   for every tenant, permanently. The endpoints now aggregate `jobs` and
+   `job_executions` directly; a rollup is a second source of truth that can
+   drift, needs a backfill, and needs its own tests to prove it has not.
+3. **`complete_job` returned the wrong boolean.** Its final `SELECT` read the
+   execution UPDATE's rowcount rather than the job's. Because a data-modifying
+   CTE always executes, a job that *was* legitimately completed but whose
+   execution row had already been closed reported a stolen lease — so the
+   worker logged `job.abandoned_stale_lease` for work that had succeeded.
+
+**Two further concurrency defects** in the worker: an unfenced write in the
+unregistered-handler path that could close a *different* worker's live attempt,
+and a heartbeat interval derived from unpaused queues only — so pausing a
+short-lease queue while holding one of its jobs widened the beat past that
+job's lease, and the reaper reclaimed a job that was still actively running.
+Fencing prevents the resulting double *commit*; it does not prevent the double
+*execution* or its side effects.
+
+**The documentation described a larger system than the repository contained.**
+Roughly twenty load-bearing claims were contradicted by the code, each
+mechanically checkable in under a minute: two tables that do not exist, a
+status-transition trigger in a schema with no triggers at all, a tenancy loader
+hook that appears nowhere (ADR-013 rejected hand-filtering as "a policy, not a
+control" — and hand-filtering is what shipped), and "a CI test asserts…" cited
+four times in a repository with no CI. Every one is now either true or removed,
+and the README's deferred list grew by eleven honest rows. One instruction was
+actively harmful: the architecture document recommended exporting an
+environment variable that, against `extra="forbid"` in the settings model,
+raises `ValidationError` and takes down the API, worker and scheduler alike.
+
 ### Automated test suite, run at submission time
 
 ```
 $ uv run ruff check app/ tests/ scripts/     All checks passed!
 $ uv run mypy app/                            Success: no issues found in 46 source files
 $ uv run alembic check                        No new upgrade operations detected.
-$ uv run pytest -q                            25 passed
+$ uv run pytest -q                            34 passed
+$ npm run build            (frontend)         built successfully
 ```
 
-Of the 25, 11 are genuine concurrency tests run against independent, real
-committed database sessions — a transaction-rollback fixture would make
-`SKIP LOCKED` tests pass vacuously, since there would be nothing to skip.
+29 of the 34 carry the `concurrency` marker and run against genuinely
+independent, committed database sessions (`NullPool` plus `TRUNCATE` teardown).
+That fixture choice is load-bearing rather than incidental: under a
+transaction-rollback fixture the `SKIP LOCKED` tests would pass **vacuously**,
+because uncommitted rows are invisible to the other session and there would be
+nothing to skip.
 
-### What was not verified live
+Nine of these tests are new, and **seven were verified to fail against the
+pre-fix code and pass after**. A regression test that has never failed is only a
+description of current behaviour.
 
-In the interest of an honest submission: the frontend dashboard was confirmed
-to start and serve (`GET / -> 200`) but was not clicked through in a browser.
-Batch job creation, DLQ replay over HTTP, and the `Idempotency-Key` header were
-exercised at the service/SQL layer by the automated test suite but not
-individually driven through a live HTTP request during this session.
+### Verified in a browser
+
+The dashboard was signed into and clicked through — project overview, queue
+detail, and job detail — rather than merely confirmed to build. Three of the
+frontend's eight contract mismatches were only observable at runtime: the queue
+page rendered as a full-page error box (it requested an endpoint that does not
+exist), the throughput chart returned `422` on every poll (an invalid window
+literal), and the global header rendered a literal `NaN` on every page. A
+passing `tsc` proved none of this, because the client types had been written by
+hand against the API document rather than generated from the server.
+
+The job timeline now renders the complete reliability story end to end:
+`claimed → started → failed → retry scheduled (full-jitter backoff)` for the
+first attempt, then `claimed → started → succeeded` under a new lease epoch —
+with real per-attempt durations, which were NULL for every row in the product
+before this pass.
+
+### What was still not verified live
+
+In the interest of an honest submission: batch job creation, DLQ replay, and the
+`Idempotency-Key` header are exercised at the service and SQL layer by the
+automated suite, but were not individually driven through a live HTTP request.
+The frontend has no automated tests. Screenshots, a recorded crash-recovery
+demo, and a throughput benchmark were planned as grader-facing evidence and were
+not completed.
 """
 
 deliverables = r"""
@@ -124,17 +201,23 @@ deliverables = r"""
 | ER diagram | `docs/DATABASE.md` (Mermaid, rendered below) | Done |
 | API documentation | `docs/API.md`, 30 live endpoints | Done |
 | Design decisions document | `docs/DESIGN_DECISIONS.md`, 17 ADRs | Done |
-| Automated tests for critical functionality | `backend/tests/`, 25/25 passing incl. 11 concurrency tests | Done |
+| Automated tests for critical functionality | `backend/tests/`, 34/34 passing; 29 carry the concurrency marker | Done |
 
 ## Repository
 
-Full source, migration history, and commit-by-commit rationale (including the
-two concurrency bugs found and fixed live) are at:
+Full source, migration history, and commit-by-commit rationale — including the
+exact interleaving that triggers each concurrency bug found and fixed — are at:
 
 **https://github.com/Surianandhan/Codity**
 
-Branch `main`, 5 commits, gate green at every commit (ruff, mypy --strict,
-alembic check, pytest).
+Branch `main`, 7 commits, gate green at every commit (ruff, mypy `--strict`,
+`alembic check`, pytest, frontend build).
+
+The commit history is worth reading as part of the submission. Each message
+states the failing scenario rather than the change: which interleaving produced
+a double execution, why `FOR NO KEY UPDATE` is required where `FOR UPDATE`
+would deadlock against the foreign key's `FOR KEY SHARE`, and why a claim
+returning zero rows must cancel the task rather than proceed.
 """
 
 now = datetime.now(timezone.utc).strftime("%Y-%m-%d")

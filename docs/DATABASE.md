@@ -71,7 +71,7 @@ described in §3.
 | `users` | Global identity. Argon2id password hash, plus `token_version` for global revocation on password change. |
 | `organization_members` | Join table carrying `role` (`owner` \| `member`). PK `(organization_id, user_id)`. There is **no** last-owner guard: membership mutation endpoints are not built (see [`API.md`](API.md) §1), so nothing can currently demote the last owner, and the guard lands with the endpoint that needs it. |
 | `refresh_tokens` | Refresh tokens keyed by `jti`, issued and persisted at register/login. `replaced_by_jti` is **declared but never written**: rotation and reuse detection need a `/auth/refresh` endpoint, and that endpoint is not built (see [`API.md`](API.md) §2). The column is the schema half of a feature whose behaviour half is deferred. |
-| `projects` | Namespace inside an org. Queue names are unique per project, not globally — which is why the worker's `--queues` takes `project-slug/queue-name`. |
+| `projects` | Namespace inside an org. Queue names are unique per project, not globally, so a queue is addressed as `project-slug/queue-name` wherever it must be named unambiguously. |
 
 ### Configuration
 
@@ -108,9 +108,10 @@ never be *configured* into guaranteed double execution.
 | `workers` | Fleet registry keyed `(organization_id, name)`. Denormalised `last_heartbeat_at` serves the hot liveness check; `drain_requested` rides back to the worker on the heartbeat's `RETURNING`. |
 | `worker_heartbeats` | Append-only history. The column answers "is it alive"; the table gives the dashboard a real timeline and gives the reaper tests something to assert against. Exposed at `GET /workers/{worker_id}/heartbeats`. |
 
-Queue **subscription** is a worker process argument (`--queues`), not a table. There is no
-`worker_queue_assignments` table and no persisted worker→queue mapping, so the dashboard cannot yet
-distinguish "this queue has no workers" from "this queue is idle". That table is the fix, and it is
+Queue **subscription does not exist** in any form. A worker serves every non-paused queue in its
+organization; there is no `--queues` flag and no `worker_queue_assignments` table, so nothing
+persists a worker→queue mapping and the dashboard cannot distinguish "this queue has no workers"
+from "this queue is idle". That table is the fix, and it is
 not built — see the deferred list in [`../README.md`](../README.md).
 
 ### Infrastructure

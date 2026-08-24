@@ -89,8 +89,10 @@ is a required CLI argument**, and it is the only way to pass the tenant. There i
 `CODITY_ORG_ID` environment variable — and exporting one would be actively harmful, because
 `config.py` uses `env_prefix="CODITY_"` with `extra="forbid"`, so any unrecognised `CODITY_*` name in
 the environment raises a `ValidationError` that takes down the API, the worker and the scheduler
-alike. `--queues` takes `project-slug/queue-name` pairs, because queue names are unique per project
-and not globally.
+alike. The worker's full argument list is `--org`, `--name` and `--concurrency`; there is **no
+`--queues` flag**. A worker serves every non-paused queue in its organization, choosing between them
+each polling cycle in weighted-random order by `queues.priority`. Per-queue subscription is not
+implemented — see the deferred list in the README.
 
 On boot the worker upserts its `workers` row keyed on `(organization_id, name)` where the default
 name is `{hostname}-{pid}`. A retention rule deletes `workers` rows in status `dead`/`stopped` older
