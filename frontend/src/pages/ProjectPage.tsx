@@ -166,20 +166,35 @@ export function ProjectPage() {
                     fontSize: 12,
                   }}
                 />
+                {/* Animation off: this chart refetches every 30s and recharts replays
+                    the grow-in on every data change, so a panel left open would twitch
+                    twice a minute for no information gain. It also makes the chart
+                    deterministic anywhere it is rendered headlessly (screenshots,
+                    print), where the rAF-driven animation otherwise races the capture
+                    and yields an empty plot. */}
                 <Area
                   type="monotone"
                   dataKey="completed"
                   stackId="1"
                   stroke="#34d399"
                   fill="#34d39955"
+                  isAnimationActive={false}
                 />
-                <Area type="monotone" dataKey="failed" stackId="1" stroke="#fb7185" fill="#fb718555" />
+                <Area
+                  type="monotone"
+                  dataKey="failed"
+                  stackId="1"
+                  stroke="#fb7185"
+                  fill="#fb718555"
+                  isAnimationActive={false}
+                />
                 <Area
                   type="monotone"
                   dataKey="dead_lettered"
                   stackId="1"
                   stroke="#f87171"
                   fill="#f8717155"
+                  isAnimationActive={false}
                 />
               </AreaChart>
             </ResponsiveContainer>
