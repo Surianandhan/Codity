@@ -28,6 +28,9 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "psycopg[binary]>=3.2",
+    # Only used by scripts/record_kill_demo.py, which renders the recovery demo to a
+    # GIF. Dev-group so it never reaches a worker or API image.
+    "pillow>=11.0",
     "types-python-jose>=3.3",
 ]
 
