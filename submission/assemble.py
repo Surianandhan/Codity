@@ -226,9 +226,13 @@ cover = f"""# Codity — Distributed Job Scheduler
 
 ### Intern Technical Assignment Submission
 
-**Author:** Surianandhan
-**Date:** {now}
-**Repository:** https://github.com/Surianandhan/Codity
+| | |
+|---|---|
+| **Author** | Surianandhan Sridhar |
+| **Register number** | 127018060 |
+| **Email** | suria24aus@gmail.com |
+| **Date** | {now} |
+| **Repository** | https://github.com/Surianandhan/Codity |
 
 ---
 
