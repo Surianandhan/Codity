@@ -230,7 +230,8 @@ cover = f"""# Codity — Distributed Job Scheduler
 |---|---|
 | **Author** | Surianandhan Sridhar |
 | **Register number** | 127018060 |
-| **Email** | suria24aus@gmail.com |
+| **College email** | 127018060@sastra.ac.in |
+| **Personal email** | suria24aus@gmail.com |
 | **Date** | {now} |
 | **Repository** | https://github.com/Surianandhan/Codity |
 
