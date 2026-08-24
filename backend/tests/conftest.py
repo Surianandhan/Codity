@@ -12,10 +12,15 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # no
 DB_URL = os.environ["CODITY_DATABASE_URL"]
 
 # Tables truncated between tests. Ordered so FK dependents go first.
+# TRUNCATE ... CASCADE reaches tables that REFERENCE these, so job_batches,
+# job_schedules, job_logs, dead_letter_entries and queue_stats_minute are all
+# cleared via their FKs to jobs/queues. system_state references nothing, so it is
+# listed explicitly -- without it, scheduler-tick rows survive between tests and
+# any assertion about /system/status staleness becomes order-dependent.
 TABLES = [
     "job_executions", "worker_heartbeats", "jobs", "workers", "queues",
     "retry_policies", "projects", "organization_members", "refresh_tokens",
-    "users", "organizations",
+    "users", "organizations", "system_state",
 ]
 
 

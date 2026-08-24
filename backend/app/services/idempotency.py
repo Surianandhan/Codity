@@ -78,11 +78,25 @@ def request_fingerprint(queue: Queue, body: Any) -> str:
     }
     if body.kind == JobKind.SCHEDULED:
         parts["run_at"] = body.run_at.astimezone(UTC).isoformat()
+    if body.kind == JobKind.BATCH:
+        # Without this, `items` is invisible to the fingerprint and two entirely
+        # different batches sharing one key would replay each other -- the caller
+        # would get the first batch's id back and never learn the second was dropped.
+        parts["items"] = body.items
+        # body.payload is the unused JobBase default for a batch; the written row's
+        # payload is items[0]. Neutralise it on both sides so they can agree.
+        parts["payload"] = {}
     return _digest(parts)
 
 
-def job_fingerprint(job: Job) -> str:
-    """The same fingerprint, recomputed from the row that was actually written."""
+def job_fingerprint(job: Job, items: list[Any] | None = None) -> str:
+    """The same fingerprint, recomputed from the row that was actually written.
+
+    ``items`` is supplied only for a batch. The item list is not stored anywhere as
+    a unit -- it lives spread across the children, one payload each -- so the caller
+    reconstructs it and passes it in. Recomputing beats storing a second copy that
+    could fall out of step with the rows it claims to describe.
+    """
     parts: dict[str, Any] = {
         "kind": str(job.kind),
         "handler": job.handler,
@@ -94,6 +108,9 @@ def job_fingerprint(job: Job) -> str:
     }
     if job.kind == JobKind.SCHEDULED:
         parts["run_at"] = job.run_at.astimezone(UTC).isoformat()
+    if job.kind == JobKind.BATCH:
+        parts["items"] = items or []
+        parts["payload"] = {}
     return _digest(parts)
 
 
@@ -143,7 +160,23 @@ async def resolve(session: AsyncSession, queue: Queue, key: str, body: Any) -> J
     if existing is None:
         return None
 
-    if job_fingerprint(existing) != request_fingerprint(queue, body):
+    items: list[Any] | None = None
+    if existing.kind == JobKind.BATCH and existing.batch_id is not None:
+        # Rebuild the submitted item list from the children. uuid7 primary keys are
+        # time-ordered and the children were inserted in request order, so ORDER BY id
+        # returns the items exactly as they arrived -- which is what makes comparing
+        # two batch bodies meaningful rather than order-dependent noise.
+        items = list(
+            (
+                await session.execute(
+                    select(Job.payload).where(Job.batch_id == existing.batch_id).order_by(Job.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    if job_fingerprint(existing, items) != request_fingerprint(queue, body):
         raise IdempotencyKeyReuse(
             f"Idempotency-Key {key!r} was already used on this queue with a different request body",
             [{"field": "Idempotency-Key", "issue": "reused_with_different_body"}],

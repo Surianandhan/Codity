@@ -13,7 +13,11 @@ import type { Job } from '../types'
 
 /**
  * The saved filters. The dead-letter queue is `?status=dead_letter` on this
- * explorer, not a sixth route — same table, same replay affordance.
+ * explorer, not a sixth route — same table, same filters, same pagination.
+ *
+ * Replay is NOT here: it lives on the job detail page, so replaying a
+ * dead-lettered job costs one extra click from this view. Batch replay from the
+ * explorer is deliberately unbuilt — see README, "Deliberately deferred".
  */
 const SAVED_FILTERS: { label: string; status: string[] }[] = [
   { label: 'All', status: [] },

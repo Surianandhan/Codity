@@ -43,7 +43,7 @@ from app.db.models.scheduling import Job, JobBatch, Queue
 from app.domain.enums import TERMINAL_STATUSES, ExecutionStatus, JobKind, JobStatus
 from app.domain.errors import ConflictError, IllegalTransition, NotFoundError, QueuePaused
 from app.services.idempotency import is_live_key_conflict, resolve
-from app.services.jobs import create_job, get_queue
+from app.services.jobs import create_batch, create_job, get_queue
 
 router = APIRouter(tags=["jobs"])
 
@@ -94,6 +94,7 @@ class BatchOut(ORMModel):
     # to drift, nothing to reconcile.
     counts: dict[str, int]
     terminal_jobs: int
+    pending: int
     progress: float
 
 
@@ -167,7 +168,82 @@ async def create_replay_job(
 # --- creation ---------------------------------------------------------------
 
 
-@router.post("/queues/{queue_id}/jobs", response_model=JobOut, status_code=201)
+async def _commit_or_key_conflict(session: AsyncSession, key: str | None) -> None:
+    """Commit, translating a lost race on the live idempotency index into a 409.
+
+    The advisory lock in ``resolve`` covers every caller that goes through this
+    module; this covers everything else, including a second API replica that got
+    past the lock in the window before the first request committed.
+    """
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        if is_live_key_conflict(exc):
+            raise ConflictError(
+                f"Idempotency-Key {key!r} is already in use on this queue",
+                [{"field": "Idempotency-Key", "issue": "in_progress"}],
+            ) from exc
+        raise
+
+
+async def _batch_summary(
+    session: AsyncSession, batch_id: UUID, organization_id: UUID
+) -> dict[str, Any]:
+    """A batch and its live progress, from one GROUP BY over ``ix_jobs_batch``.
+
+    Nothing is incremented on completion and nothing is reconciled after a crash:
+    the counts are derived from the child rows every time they are asked for, so
+    they cannot drift from the thing they describe.
+    """
+    batch = (
+        await session.execute(
+            select(JobBatch).where(
+                JobBatch.id == batch_id,
+                JobBatch.organization_id == organization_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if batch is None:
+        raise NotFoundError("batch not found")
+
+    rows = (
+        await session.execute(
+            select(Job.status, func.count())
+            .where(Job.batch_id == batch_id, Job.organization_id == organization_id)
+            .group_by(Job.status)
+        )
+    ).all()
+    counts = {str(status): int(n) for status, n in rows}
+    terminal = sum(n for status, n in counts.items() if JobStatus(status) in TERMINAL_STATUSES)
+
+    return {
+        "id": batch.id,
+        "project_id": batch.project_id,
+        "queue_id": batch.queue_id,
+        "name": batch.name,
+        "handler": batch.handler,
+        "total_jobs": batch.total_jobs,
+        "created_at": batch.created_at,
+        "counts": counts,
+        "terminal_jobs": terminal,
+        "pending": batch.total_jobs - terminal,
+        "progress": round(terminal / batch.total_jobs, 4) if batch.total_jobs else 0.0,
+    }
+
+
+@router.post(
+    "/queues/{queue_id}/jobs",
+    response_model=JobOut | BatchOut,
+    status_code=201,
+    summary="Create a job, or a batch of jobs",
+    description=(
+        "One endpoint, five kinds, discriminated on `kind`. Every kind except "
+        "`batch` returns a `JobOut`. A `batch` creates one job per item and returns "
+        "a `BatchOut` -- returning a single arbitrary child for a request that made "
+        "a thousand of them would leave the caller with no id it can poll."
+    ),
+)
 async def enqueue(
     queue_id: UUID,
     body: JobCreate,
@@ -175,7 +251,7 @@ async def enqueue(
     session: SessionDep,
     request: Request,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-) -> Job:
+) -> Job | dict[str, Any]:
     queue = await get_queue(session, queue_id, principal.organization_id)
     if queue.is_paused:
         # Pause blocks admission only; in-flight work is unaffected.
@@ -190,21 +266,26 @@ async def enqueue(
         if replayed is not None:
             # Commit to release the advisory lock, then return the original 201.
             await session.commit()
+            if replayed.batch_id is not None:
+                # The key rides on the first child, but a replay must answer in the
+                # same shape the original request did -- the batch, not one of its
+                # thousand children.
+                return await _batch_summary(
+                    session, replayed.batch_id, principal.organization_id
+                )
             return replayed
+
+    if body.kind == JobKind.BATCH:
+        batch = await create_batch(
+            session, queue, body, correlation_id=request_id(request)
+        )
+        await _commit_or_key_conflict(session, key)
+        return await _batch_summary(session, batch.id, principal.organization_id)
 
     job = await create_job(
         session, queue, body, correlation_id=request_id(request)
     )
-    try:
-        await session.commit()
-    except IntegrityError as exc:
-        await session.rollback()
-        if is_live_key_conflict(exc):
-            raise ConflictError(
-                f"Idempotency-Key {key!r} is already in use on this queue",
-                [{"field": "Idempotency-Key", "issue": "in_progress"}],
-            ) from exc
-        raise
+    await _commit_or_key_conflict(session, key)
     await session.refresh(job)
     return job
 
@@ -489,36 +570,4 @@ async def list_logs(
 async def get_batch(
     batch_id: UUID, principal: PrincipalDep, session: SessionDep
 ) -> dict[str, Any]:
-    batch = (
-        await session.execute(
-            select(JobBatch).where(
-                JobBatch.id == batch_id,
-                JobBatch.organization_id == principal.organization_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if batch is None:
-        raise NotFoundError("batch not found")
-
-    rows = (
-        await session.execute(
-            select(Job.status, func.count())
-            .where(Job.batch_id == batch_id, Job.organization_id == principal.organization_id)
-            .group_by(Job.status)
-        )
-    ).all()
-    counts = {str(status): int(n) for status, n in rows}
-    terminal = sum(n for status, n in counts.items() if JobStatus(status) in TERMINAL_STATUSES)
-
-    return {
-        "id": batch.id,
-        "project_id": batch.project_id,
-        "queue_id": batch.queue_id,
-        "name": batch.name,
-        "handler": batch.handler,
-        "total_jobs": batch.total_jobs,
-        "created_at": batch.created_at,
-        "counts": counts,
-        "terminal_jobs": terminal,
-        "progress": round(terminal / batch.total_jobs, 4) if batch.total_jobs else 0.0,
-    }
+    return await _batch_summary(session, batch_id, principal.organization_id)
