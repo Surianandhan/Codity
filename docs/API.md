@@ -172,6 +172,19 @@ Common fields: `handler`, `payload`, `priority` (−100..100, **higher runs firs
 configuration and **snapshotted onto the job row**, so later edits to the queue or its retry policy
 never retroactively change a job already mid-retry.
 
+**The response is a union.** Four of the five kinds return a `JobOut`. `batch` returns a `BatchOut`
+— `id`, `total_jobs`, `counts`, `terminal_jobs`, `pending`, `progress` — because returning one
+arbitrary child for a request that created a thousand is not a smaller answer, it is a wrong one:
+the caller is left holding a job id when what they need is something they can poll. Poll it at
+`GET /batches/{batch_id}`, whose numbers come from a single `GROUP BY status` over `ix_jobs_batch`
+rather than maintained counters, so there is nothing to increment on completion and nothing to
+reconcile after a crash.
+
+The batch and all of its children are written in **one transaction**: a child that violates a
+constraint takes the whole request with it, because a half-written batch would report a `total_jobs`
+its children can never reach. `Idempotency-Key` covers the item list too — two different batches
+sent under one key is a `422`, not a silent replay of the first.
+
 ```bash
 curl -sS -X POST http://localhost:8000/api/v1/queues/$QUEUE_ID/jobs \
   -H "Authorization: Bearer $TOKEN" \

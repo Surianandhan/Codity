@@ -20,6 +20,29 @@ replicas without coordination.
 | `worker` | Claim → execute → complete/fail. Heartbeats. Graceful drain. | N replicas; this is the throughput knob |
 | `scheduler` | Promoter, cron dispatcher, lease reaper, dead-worker sweep, retention sweep. | N replicas; correctness does not depend on N=1 |
 
+### What "the throughput knob" is actually worth
+
+`backend/scripts/bench_claim.py` measures the claim path alone — `lock_queue.sql` +
+`claim_jobs.sql` + `COMMIT`, no handler execution — against a fixed backlog, with one dedicated
+Postgres backend per claimer:
+
+| Claimers | Claims/s | p50 | p95 | Disjoint |
+|---:|---:|---:|---:|:--|
+| 1 | 6,997 | 1.35 ms | 1.89 ms | PASS |
+| 2 | 7,264 | 2.64 ms | 3.76 ms | PASS |
+| 4 | 6,960 | 5.48 ms | 8.18 ms | PASS |
+| 8 | 7,663 | 8.92 ms | 17.29 ms | PASS |
+
+**The flat curve is the finding, not a disappointment.** Claims against *one queue* serialise on
+that queue's row lock — which is precisely what makes `max_concurrency` an exact cap rather than an
+approximate one ([ADR-003](DESIGN_DECISIONS.md)). Adding claimers to a single queue redistributes
+the same ~7k claims/s among more waiters rather than multiplying it, and p95 climbing from 1.9 ms to
+17.3 ms is that queueing made visible. Throughput scales with **queues**, not with claimers per
+queue; when one queue genuinely needs more, sharding it is the documented next step.
+
+Read the throughput column only alongside the disjointness column. A claim path that hands the same
+job to two workers can be made arbitrarily fast.
+
 ```mermaid
 graph TB
     subgraph Clients

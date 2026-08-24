@@ -134,6 +134,26 @@ make setup && make migrate && make seed
 
 ---
 
+## What it looks like
+
+Captures of the running system, not mockups.
+
+**Project dashboard** — live queue health, with the throughput chart showing two `make demo` runs.
+
+![Project dashboard](docs/images/dashboard.png)
+
+**Job timeline** — one job's reliability story, rendered from `job_executions`: attempt 1 fails
+after `ran 8ms · waited 5.8s`, a full-jitter retry is scheduled, and attempt 2 succeeds under a
+**new lease epoch**. The epoch change is the fencing token doing its job, and the durations exist
+because the attempt row is moved to `running` when work starts rather than left open until it ends.
+
+![Job timeline](docs/images/job-timeline.png)
+
+**Worker fleet** — liveness is computed from `now()` in Postgres, not the browser clock, so a laptop
+with a skewed clock cannot invent a dead worker.
+
+![Worker fleet](docs/images/workers.png)
+
 ## See it work
 
 **[`docs/GRADER_WALKTHROUGH.md`](docs/GRADER_WALKTHROUGH.md) is a numbered ~10 minute path** through

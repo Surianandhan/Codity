@@ -15,16 +15,37 @@ make check
 `pytest` + `pytest-asyncio` + `httpx.AsyncClient`, against a **real local PostgreSQL** database
 (`codity_test`), with `alembic upgrade head` run once per session.
 
-**34 tests across seven files.** Nine of those are regression tests in the strict sense — written
+**54 tests across nine files.** Nine of those are regression tests in the strict sense — written
 after a defect was found, and **verified to fail against the code they replace**: two of the three
 in `tests/test_execution_timing.py`, and all six in `tests/test_worker_lifecycle.py`. That is what
 separates a regression test from one written to match whatever the code already does, and it is the
-distinction §3 leans on. 34 is a small number, and it is deliberately spent: it buys the
-reliability invariants in §3 — disjoint claims, an exact concurrency cap, lease fencing including
-the ABA case, orphaned-execution recovery, the shutdown race, and cron under two schedulers — rather
-than breadth across routers. Every one of them runs against genuinely independent **committed**
-sessions (§2), which is the difference between testing `SKIP LOCKED` and testing nothing. What that
-choice costs is listed honestly at the end of §3.
+distinction §3 leans on.
+
+The suite is deliberately spent rather than broad. Roughly half buys the reliability invariants in
+§3 — disjoint claims, an exact concurrency cap, lease fencing including the ABA case,
+orphaned-execution recovery, the shutdown race, and cron under two schedulers. Those run against
+genuinely independent **committed** sessions (§2), which is the difference between testing
+`SKIP LOCKED` and testing nothing.
+
+| File | Tests | What it holds |
+|---|---:|---|
+| `test_api.py` | 14 | cross-org isolation, idempotency, cancel, DLQ replay, keyset paging, the error envelope |
+| `test_concurrency.py` | 11 | claim disjointness, the exact cap, fencing, the ABA case, orphan recovery |
+| `test_batch.py` | 6 | one job per item, one transaction, live progress, batch idempotency |
+| `test_worker_lifecycle.py` | 6 | unregistered-handler fencing, heartbeat cadence, release backoff |
+| `test_scheduling.py` | 4 | promoter, cron under two schedulers, occurrence advance |
+| `test_retry.py` | 3 | backoff per strategy, retry destination, DLQ on exhaustion |
+| `test_execution_timing.py` | 3 | the attempt row reaching `running`, `duration_ms`, epoch fencing |
+| `test_migrations.py` | 3 | upgrade, the double up/down round trip, enum label drift |
+| `test_slice1_e2e.py` | 2 | the walking skeleton, end to end over HTTP |
+
+Cross-org isolation is worth singling out: ADR-013 calls tenant leakage the worst bug this system
+could ship, and until recently it had **zero** tests. Each case now asserts the resource is readable
+by its owner *first*, so the 404 that follows is evidence of tenancy rather than of a mistyped URL —
+and rejected writes are asserted to leave the database byte-identical, because "rejected but still
+mutated" is the failure worth catching.
+
+What this choice costs is listed honestly at the end of §3.
 
 ---
 
@@ -69,10 +90,14 @@ caches an engine at module level, pytest-asyncio gives each test a fresh event l
 engine holds connections bound to a dead loop — so the *next* test dies with `Event loop is closed`.
 
 Concurrency tests are marked `@pytest.mark.concurrency`, applied at **module level** in
-`test_concurrency.py`, `test_retry.py`, `test_scheduling.py`, `test_execution_timing.py` and
-`test_worker_lifecycle.py`. So `make test-concurrency` (`pytest -m concurrency`) selects **29 of the
-34 tests** — most of the suite, not a corner of it. The five it deselects are the three migration
-tests and the two API end-to-end tests.
+`test_concurrency.py`, `test_retry.py`, `test_scheduling.py`, `test_execution_timing.py`,
+`test_worker_lifecycle.py` and `test_batch.py`. So `make test-concurrency` (`pytest -m concurrency`)
+selects **30 of the 54 tests**.
+
+`test_api.py` deliberately carries no module-level marker. Its subject is the HTTP contract —
+status codes, envelopes, tenancy — not the claim path, and a marker that selects everything selects
+nothing. The one exception is its in-flight idempotency test, marked individually because it holds a
+`pg_try_advisory_xact_lock` from a second session and genuinely needs committed cross-session state.
 
 ---
 

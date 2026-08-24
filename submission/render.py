@@ -36,6 +36,24 @@ for i, raw in enumerate(mermaid_blocks):
         raise RuntimeError(f"placeholder {i} not found verbatim in HTML output")
     body_html = body_html.replace(placeholder_p, replacement)
 
+# The README embeds screenshots as repo-relative paths. Those resolve on GitHub, but
+# this HTML lives in submission/, so `docs/images/x.png` would point at
+# submission/docs/images/x.png and Chrome would print three empty boxes. Rewrite them
+# to absolute file:// URLs, and fail loudly on a missing file rather than shipping a
+# PDF with holes where the evidence should be.
+REPO = Path("/Users/AIRUS/Documents/Codity")
+
+
+def _absolutise(m: re.Match[str]) -> str:
+    target = REPO / m.group(1)
+    if not target.exists():
+        raise RuntimeError(f"image referenced but missing: {target}")
+    return f'src="file://{target}"'
+
+
+body_html, n_imgs = re.subn(r'src="((?:docs|images)/[^"]+)"', _absolutise, body_html)
+print(f"resolved {n_imgs} image reference(s) to absolute paths")
+
 pygments_css = ""
 try:
     from pygments.formatters import HtmlFormatter
@@ -106,6 +124,17 @@ pre.mermaid {{
   page-break-inside: avoid;
 }}
 pre.mermaid svg {{ max-width: 100%; height: auto; }}
+/* Screenshots are captured at 1440px. Without this they overflow the A4 text
+   column and Chrome silently clips the right-hand side -- which cut the throughput
+   spikes off the dashboard capture, making a working chart look empty. */
+img {{
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 10px auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+}}
 table {{
   border-collapse: collapse;
   width: 100%;
